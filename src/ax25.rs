@@ -17,6 +17,11 @@ pub const RR: u8 = 0x01;
 pub const RNR: u8 = 0x05;
 pub const REJ: u8 = 0x09;
 pub const PF: u8 = 0x10;
+/// AX.25 v2.2 only: extended (modulo 128) connect, capability exchange, selective reject.
+pub const SABME: u8 = 0x6F;
+pub const XID: u8 = 0xAF;
+pub const SREJ: u8 = 0x0D;
+pub const TEST: u8 = 0xE3;
 pub const PID_NONE: u8 = 0xF0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,10 +126,36 @@ pub fn describe(raw: &[u8]) -> String {
             let text = if f.pid.is_some() {
                 String::from_utf8_lossy(&f.info).replace(['\r', '\n'], " ").trim_end().to_string()
             } else {
-                "(link control)".to_string()
+                format!("<{}>", control_name(f.ctl))
             };
             format!("{} > {}{}: {}", f.src, f.dst, via, text)
         }
+    }
+}
+
+/// Plain name of a link-control frame; v2.2-only kinds say so, since seeing one means the sender speaks v2.2.
+pub fn control_name(ctl: u8) -> String {
+    if ctl & 3 == 1 {
+        let nr = ctl >> 5;
+        return match ctl & 0x0F {
+            RR => format!("RR ack, next {nr}"),
+            RNR => "RNR busy".into(),
+            REJ => format!("REJ resend from {nr}"),
+            SREJ => format!("SREJ resend {nr} only, v2.2"),
+            _ => format!("S {ctl:02x}"),
+        };
+    }
+    match ctl & !PF {
+        SABM => "SABM connect".into(),
+        SABME => "SABME connect, v2.2".into(),
+        UA => "UA ok".into(),
+        DM => "DM refused".into(),
+        DISC => "DISC disconnect".into(),
+        FRMR => "FRMR frame reject".into(),
+        XID => "XID capabilities, v2.2".into(),
+        TEST => "TEST".into(),
+        UI => "UI".into(),
+        c => format!("control {c:02x}"),
     }
 }
 
@@ -489,7 +520,9 @@ mod tests {
         assert_eq!((f.pid, f.info.as_slice()), (Some(0xF0), b"hi".as_slice()));
         assert_eq!(describe(&raw), "B2B > A1A via WIDE1-1: hi");
         let rr = build("A1A", "B2B", &[], RR, false, None, &[]).unwrap();
-        assert_eq!(describe(&rr), "B2B > A1A: (link control)");
+        assert_eq!(describe(&rr), "B2B > A1A: <RR ack, next 0>");
+        let sabme = build("A1A", "B2B", &[], SABME | PF, true, None, &[]).unwrap();
+        assert_eq!(describe(&sabme), "B2B > A1A: <SABME connect, v2.2>");
     }
 
     #[test]

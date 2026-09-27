@@ -429,3 +429,23 @@ fn rigctl_server_drives_the_engine() {
     assert_eq!(rig.radio.lock().unwrap().freq[1], 146_520_000);
     assert!(!rig.radio.lock().unwrap().keyed);
 }
+
+/// /listen names link-control frames, and a station seen using a v2.2-only frame is marked in the heard list.
+#[test]
+fn listen_labels_v22_frames() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("v22");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.h().send(Job::Listen(true, None));
+    rig.wait_for("listening on", None);
+    let sabme = ax25::build("N0BBS-3", "N1XYZ-7", &[], ax25::SABME | ax25::PF, true, None, &[]).unwrap();
+    let rr = ax25::build("N0BBS-3", "NODE1", &[], ax25::RR, false, None, &[]).unwrap();
+    for f in [sabme, rr] {
+        rig.radio.lock().unwrap().to_host.extend(kiss::frame(0, &f, 0));
+    }
+    rig.wait_for("N1XYZ-7 > N0BBS-3: <SABME connect, v2.2>", None);
+    rig.wait_for("NODE1 > N0BBS-3: <RR ack, next 0>", None);
+    let heard = rig.h().snap.lock().unwrap().heard.clone();
+    assert!(heard.iter().any(|h| h.call == "N1XYZ-7" && h.v22));
+    assert!(heard.iter().any(|h| h.call == "NODE1" && !h.v22));
+}

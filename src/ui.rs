@@ -1141,6 +1141,7 @@ impl App {
             Span::styled(format!(" {:<10}", h.call), t.value),
             Span::styled(format!("{} ", &engine::hhmmss(h.last_utc_secs)[..5]), t.dim),
             Span::styled(format!("{:>3}x", h.count), t.label),
+            Span::styled(if h.v22 { " v2.2" } else { "" }.to_string(), t.good),
         ])).collect()
     }
 

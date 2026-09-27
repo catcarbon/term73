@@ -72,6 +72,8 @@ pub struct HeardEntry {
     pub call: String,
     pub count: u32,
     pub last_utc_secs: u64,
+    /// Seen sending a frame only AX.25 v2.2 has (SABME, XID or SREJ).
+    pub v22: bool,
 }
 
 /// What the UI panels show; refreshed by the engine after every change.
@@ -899,6 +901,7 @@ impl Engine {
             let e = self.heard.entry(f.src.clone()).or_insert_with(|| HeardEntry { call: f.src.clone(), ..Default::default() });
             e.count += 1;
             e.last_utc_secs = now_utc_secs();
+            e.v22 |= f.pid.is_none() && (matches!(f.ctl & !ax25::PF, ax25::SABME | ax25::XID) || (f.ctl & 3 == 1 && f.ctl & 0x0F == ax25::SREJ));
         }
     }
 
