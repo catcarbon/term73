@@ -97,6 +97,8 @@ pub enum Job {
     Open(Target),
     Close,
     Cat(String),
+    /// Repeat a read command every 2 s and report which fields change; None stops.
+    Watch(Option<String>),
     Ident,
     Tune(f64),
     Power(u8),
@@ -231,6 +233,7 @@ struct Engine {
     decoder: kiss::Decoder,
     station: Option<Station>,
     rx_cr: bool,
+    watch: Option<Watch>,
     closing: bool,
     heard: BTreeMap<String, HeardEntry>,
     bridge_listener: Option<(Arc<std::sync::atomic::AtomicBool>, u16)>,
@@ -258,7 +261,7 @@ impl Engine {
         let e = Engine {
             out, snap, opener, self_jobs, cfg, target: None, radio: None, modem: None, ctl: None, model: None,
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
-            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, closing: false,
+            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, watch: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
             ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, running: true,
         };
@@ -307,6 +310,7 @@ impl Engine {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            self.poll_watch();
             if let Err(e) = self.service() {
                 self.say(format!("error: {e}"));
             }
@@ -333,6 +337,23 @@ impl Engine {
                 let r = cat::cat(self.radio.as_deref_mut().unwrap(), &line, Duration::from_secs(2), self.tx_allowed)
                     .map_err(|e| format!("refused: {e}"))?;
                 self.say(format!("{} -> {}", line.trim(), if r.is_empty() { "(no reply)" } else { &r }));
+            }
+            Job::Watch(None) => {
+                if self.watch.take().is_some() {
+                    self.say("watch stopped");
+                }
+            }
+            Job::Watch(Some(line)) => {
+                self.need_cat()?;
+                if self.kiss {
+                    return Err("the radio is in packet mode; watch needs rig control (end the session or /listen off first)".into());
+                }
+                if !crate::discover::is_read_form(&line) {
+                    return Err("watch only takes a read command, e.g. FO 1, SQ 1, BC or ME 900".into());
+                }
+                let cmd = line.trim().to_ascii_uppercase();
+                self.say(format!("watching {cmd} every 2 s; change one setting at a time on the radio. /advanced watch off stops"));
+                self.watch = Some(Watch { cmd, last: None, next: Instant::now() });
             }
             Job::Ident => {
                 self.need_cat()?;
@@ -1046,6 +1067,42 @@ impl Drop for Engine {
             let _ = self.ptt(false);
         }
         self.leave_kiss();
+    }
+}
+
+struct Watch {
+    cmd: String,
+    last: Option<String>,
+    next: Instant,
+}
+
+impl Engine {
+    fn poll_watch(&mut self) {
+        let Some(w) = self.watch.as_mut() else { return };
+        if Instant::now() < w.next {
+            return;
+        }
+        w.next = Instant::now() + Duration::from_secs(2);
+        let cmd = w.cmd.clone();
+        if self.kiss || self.radio.is_none() {
+            self.watch = None;
+            self.say("watch stopped: rig control is no longer available");
+            return;
+        }
+        let r = cat::cat(self.radio.as_deref_mut().unwrap(), &cmd, Duration::from_secs(2), false).unwrap_or_default();
+        let w = self.watch.as_mut().unwrap();
+        match w.last.replace(r.clone()) {
+            None => {
+                let fields: Vec<String> = r.split_once(' ').map(|(_, f)| f).unwrap_or(&r).split(',')
+                    .enumerate().map(|(i, v)| format!("{i}={v}")).collect();
+                self.say(format!("{cmd} now: {}", if r.is_empty() { "(no reply)".into() } else { fields.join(" ") }));
+            }
+            Some(prev) if prev != r => {
+                let changes = crate::discover::field_changes(&prev, &r);
+                self.say(format!("{cmd} changed: {}", changes.join("; ")));
+            }
+            Some(_) => {}
+        }
     }
 }
 

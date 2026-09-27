@@ -162,3 +162,54 @@ mod tests {
         assert_eq!(detected_bands(&[28.0]), None);
     }
 }
+
+/// True for a command that can only read: a bare command from `SAFE_BARE`, a `SAFE_BAND`
+/// command with a single band digit, or `ME` with a three-digit channel. Anything with more
+/// arguments may be a setting (for example "AG 010" sets the volume), so it is not a read form.
+pub fn is_read_form(line: &str) -> bool {
+    let line = line.trim().to_ascii_uppercase();
+    let (name, arg) = line.split_once(' ').map(|(n, a)| (n, a.trim())).unwrap_or((line.as_str(), ""));
+    match arg {
+        "" => SAFE_BARE.contains(&name),
+        a if a.len() == 1 && a.chars().all(|c| c.is_ascii_digit()) => SAFE_BAND.contains(&name),
+        a if name == "ME" && a.len() == 3 && a.chars().all(|c| c.is_ascii_digit()) => true,
+        _ => false,
+    }
+}
+
+/// Field-by-field changes between two replies to the same read ("FO 1,..." style), as "field 11: 0 -> 2".
+pub fn field_changes(before: &str, after: &str) -> Vec<String> {
+    let fields = |r: &str| -> Vec<String> {
+        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(r).split(',').map(str::to_string).collect()
+    };
+    let (a, b) = (fields(before), fields(after));
+    (0..a.len().max(b.len()))
+        .filter_map(|i| {
+            let (x, y) = (a.get(i).map(String::as_str).unwrap_or("-"), b.get(i).map(String::as_str).unwrap_or("-"));
+            (x != y).then(|| format!("field {i}: {x} -> {y}"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod read_form_tests {
+    use super::*;
+
+    #[test]
+    fn only_reads_pass() {
+        for ok in ["FO 1", "fo 0", "BC", "SQ 1", "ME 900", "AG", "RT"] {
+            assert!(is_read_form(ok), "{ok}");
+        }
+        for no in ["FO 1,0145030000", "AG 010", "BC 1", "ME 900,", "TX", "SR", "FQ 12", "VX 1"] {
+            assert!(!is_read_form(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn changes_are_numbered_from_the_first_argument() {
+        let a = "FO 1,0145030000,0000600000,2,2,0,0,0,0,0,0,0,08";
+        let b = "FO 1,0145030000,0000600000,2,2,0,0,0,0,0,0,2,08";
+        assert_eq!(field_changes(a, b), vec!["field 11: 0 -> 2"]);
+        assert!(field_changes(a, a).is_empty());
+    }
+}

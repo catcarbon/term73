@@ -353,3 +353,24 @@ fn shutdown_within_budget_when_the_station_is_silent() {
     let discs = radio.to_air.iter().filter_map(|f| ax25::parse(f)).filter(|f| f.ctl & !0x10 == ax25::DISC).count();
     assert!(discs >= 1, "no DISC was sent");
 }
+
+/// Watch repeats a read and reports only the fields a front-panel change touched.
+#[test]
+fn watch_reports_changed_fields() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("watch");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    rig.h().send(Job::Watch(Some("AG 010".into())));
+    rig.wait_for("watch only takes a read command", None);
+    rig.h().send(Job::Watch(Some("fo 1".into())));
+    rig.wait_for("FO 1 now: 0=1 1=0145030000 2=0000600000", None);
+    rig.radio.lock().unwrap().freq[1] = 145_090_000; // as if turned on the radio's dial
+    rig.wait_for("FO 1 changed: field 1: 0145030000 -> 0145090000", None);
+    assert!(!rig.text.contains("field 2:"), "only the changed field is reported:\n{}", rig.text);
+    rig.h().send(Job::Watch(None));
+    rig.wait_for("watch stopped", None);
+    let reads = rig.radio.lock().unwrap().cat_log.iter().filter(|l| l.as_str() == "FO 1").count();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(rig.radio.lock().unwrap().cat_log.iter().filter(|l| l.as_str() == "FO 1").count(), reads, "no reads after stopping");
+}

@@ -60,6 +60,7 @@ pub const HELP: &[(&str, &str)] = &[
 Keys: F10 or Alt+letter opens the menus, F1 help, PageUp/PageDown scroll, Tab completes, Ctrl+C ends a connection (twice to quit), Ctrl+Q or Alt+X quits.
 While connected, / lines that are not term73 commands (like /EX) go to the station; // sends a single /. Ctrl+Z sends Ctrl-Z (ends a BBS message)."),
     ("advanced", "/advanced cat <command>       send one raw rig-control command, e.g. /advanced cat FQ 1
+/advanced watch <read> | off  repeat a read command (e.g. FO 1) every 2 s and show which fields change
 /advanced kiss on|off         switch the radio's TNC by hand
 /advanced modem status        software modem state (control port)
 /advanced modem set key=value ...
@@ -72,7 +73,7 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("/power", &["high", "mid", "low"]), ("/transmit", &["on", "off"]),
     ("/bbs", &["add", "edit", "list", "connect", "remove"]), ("/winlink", &["setup", "gateways", "start", "stop"]),
     ("/radio", &["scan", "list", "select", "setup", "info", "off"]), ("/config", &["show", "callsign", "grid"]),
-    ("/advanced", &["cat", "kiss", "modem", "rigctl"]),
+    ("/advanced", &["cat", "watch", "kiss", "modem", "rigctl"]),
     ("/help", &["basics", "bbs", "winlink", "radio", "settings", "advanced"]), ("/clear", &[]), ("/quit", &[]),
 ];
 
@@ -971,6 +972,8 @@ impl App {
             },
             "/advanced" => match (sub.as_str(), rest.first().map(|s| s.to_ascii_lowercase()).as_deref()) {
                 ("cat", _) => e.send(Job::Cat(rest.join(" "))),
+                ("watch", Some("off")) => e.send(Job::Watch(None)),
+                ("watch", Some(_)) => e.send(Job::Watch(Some(rest.join(" ")))),
                 ("kiss", Some("on")) => e.send(Job::KissOn),
                 ("kiss", Some("off")) => e.send(Job::KissOff),
                 ("modem", Some("status")) => e.send(Job::ModemStatus),
