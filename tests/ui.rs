@@ -103,7 +103,7 @@ fn scripted_session() {
     app.tick();
     term.draw(|f| app.draw(f)).unwrap();
     let screen: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-    for needle in ["TERM73", "N0CALL", " RIG ", " HEARD ", " BBS ", "TM-D750", "145.090 MHz", "bbs3"] {
+    for needle in ["TERM73", "N0CALL", " RIG ", " STATIONS ", "TM-D750", "145.090 MHz", "bbs3", "not heard yet"] {
         assert!(screen.contains(needle), "screen lacks {needle:?}");
     }
     app.shutdown();
@@ -145,7 +145,7 @@ fn turbo_menus_run_commands() {
         term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
     };
     let s = screen(&mut app);
-    for needle in ["Radio", "Channel", "Winlink", "[■] term73", " Rig ", " Heard ", "F10 Menu", "N0CALL"] {
+    for needle in ["Radio", "Channel", "Winlink", "[■] term73", " Rig ", " Stations ", "F10 Menu", "N0CALL"] {
         assert!(s.contains(needle), "screen lacks {needle:?}");
     }
     // Alt+R opens Radio; its letters pick items
@@ -220,4 +220,28 @@ fn turbo_popups_build_commands() {
     assert!(!app.popup_is_open());
     assert!(!text(&app).contains("/config grid"));
     app.shutdown();
+}
+
+#[test]
+fn f8_hides_and_shows_the_side_panels() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempdir::Dir::new("ui-f8");
+    unsafe { std::env::set_var("TERM73_HOME", &home.0) };
+    term73::config::AppConfig { callsign: Some("N0CALL".into()), ..Default::default() }.save().unwrap();
+    let fail = || std::io::Error::other("no radio in this test");
+    for theme in [Theme::turbo(), Theme::seafoam()] {
+        let mut app = App::new(theme, Box::new(move |_t: &Target| Err(fail())), Arc::new(move |_t: &Target| Err(fail())));
+        let screen = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+            app.tick();
+            term.draw(|f| app.draw(f)).unwrap();
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>().to_ascii_uppercase()
+        };
+        assert!(screen(&mut app).contains(" STATIONS "));
+        app.toggle_side();
+        assert!(!screen(&mut app).contains(" STATIONS "));
+        app.toggle_side();
+        assert!(screen(&mut app).contains(" STATIONS "));
+        app.shutdown();
+    }
 }

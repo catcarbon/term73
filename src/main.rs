@@ -124,6 +124,7 @@ fn run(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::
                 app.open_menu(None);
             }
             KeyCode::F(1) => app.run_line("/help"),
+            KeyCode::F(8) => app.toggle_side(),
             KeyCode::Char('c') if ctrl => app.ctrl_c(),
             KeyCode::Char('q') if ctrl => app.quit = true,
             KeyCode::Char('z') if ctrl => app.ctrl_z(),

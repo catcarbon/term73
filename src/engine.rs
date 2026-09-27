@@ -92,6 +92,24 @@ pub struct Snapshot {
     pub transmitting: bool,
     pub software_modem: bool,
     pub heard: Vec<HeardEntry>,
+    /// The connected (or connecting) station, for the Session panel.
+    pub session: Option<SessionInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionInfo {
+    pub remote: String,
+    /// Name of the saved station profile with this callsign, if any.
+    pub name: Option<String>,
+    pub path: Vec<String>,
+    pub connected: bool,
+    /// "2.2" or "2.0" once connected.
+    pub version: String,
+    pub window: usize,
+    pub paclen: usize,
+    pub since_utc_secs: Option<u64>,
+    pub unacked: usize,
+    pub stats: ax25::LinkStats,
 }
 
 type Reply<T> = Sender<Result<T, String>>;
@@ -244,6 +262,9 @@ struct Engine {
     ax25_seen: BTreeMap<String, &'static str>,
     /// The current session's version has been recorded.
     ax25_noted: bool,
+    /// When the current session connected, and the saved profile it belongs to.
+    session_since: Option<u64>,
+    session_name: Option<String>,
     closing: bool,
     heard: BTreeMap<String, HeardEntry>,
     bridge_listener: Option<(Arc<std::sync::atomic::AtomicBool>, u16)>,
@@ -275,7 +296,7 @@ impl Engine {
         let e = Engine {
             out, snap, opener, self_jobs, cfg, target: None, radio: None, modem: None, ctl: None, model: None,
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
-            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, closing: false,
+            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
             ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, running: true,
         };
@@ -311,6 +332,21 @@ impl Engine {
         heard.sort_by_key(|h| std::cmp::Reverse(h.last_utc_secs));
         heard.truncate(30);
         s.heard = heard;
+        s.session = self.station.as_ref().filter(|st| st.state != State::Disconnected).map(|st| {
+            let (window, paclen) = st.window_and_paclen();
+            SessionInfo {
+                remote: st.remote.clone(),
+                name: self.session_name.clone(),
+                path: st.path.clone(),
+                connected: st.state == State::Connected,
+                version: if st.state == State::Connected { st.version().to_string() } else { String::new() },
+                window,
+                paclen,
+                since_utc_secs: self.session_since,
+                unacked: st.unacked(),
+                stats: st.stats().clone(),
+            }
+        });
     }
 
     fn run(mut self, rx: Receiver<Job>) {
@@ -779,6 +815,8 @@ impl Engine {
         self.enter_kiss()?;
         let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config(call));
         self.ax25_noted = false;
+        self.session_since = None;
+        self.session_name = config::load_bbs().into_iter().find(|(_, b)| ax25::same_call(&b.call, call)).map(|(n, _)| n);
         st.connect(call, path, attempts.or(Some(3)), Instant::now());
         self.station = Some(st);
         self.rx_cr = false;
@@ -848,6 +886,7 @@ impl Engine {
         let learned = (state == State::Connected && !self.ax25_noted).then(|| (st.remote.clone(), st.version()));
         if let Some((remote, version)) = learned {
             self.ax25_noted = true;
+            self.session_since = Some(now_utc_secs());
             self.note_ax25_version(&remote, version);
         }
         for raw in outbox {

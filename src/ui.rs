@@ -57,7 +57,7 @@ pub const HELP: &[(&str, &str)] = &[
 /config callsign <CALL>
 /config grid <LOCATOR>
 /clear   /quit
-Keys: F10 or Alt+letter opens the menus, F1 help, PageUp/PageDown scroll, Tab completes, Ctrl+C ends a connection (twice to quit), Ctrl+Q or Alt+X quits.
+Keys: F10 or Alt+letter opens the menus, F1 help, F8 shows or hides the side panels, PageUp/PageDown scroll, Tab completes, Ctrl+C ends a connection (twice to quit), Ctrl+Q or Alt+X quits.
 While connected, / lines that are not term73 commands (like /EX) go to the station; // sends a single /. Ctrl+Z sends Ctrl-Z (ends a BBS message)."),
     ("advanced", "/advanced cat <command>       send one raw rig-control command, e.g. /advanced cat FQ 1
 /advanced watch <read> | off  repeat a read command (e.g. FO 1) every 2 s and show which fields change
@@ -557,6 +557,8 @@ pub struct App {
     snap: Snapshot,
     menu: Option<turbo::MenuState>,
     popup: Option<popup::Popup>,
+    /// F8 hides the side panels (rig, stations or session).
+    side_hidden: bool,
 }
 
 impl App {
@@ -569,7 +571,7 @@ impl App {
         let mut app = App {
             theme, engine, out_rx, out_tx, ask_rx, ctx, open, main: vec![WELCOME.into()], remote: vec![false], remote_open: false, traffic: Vec::new(),
             scroll: 0, input: String::new(), cursor: 0, history: Vec::new(), hist_pos: None, pending: None,
-            busy: Arc::new(AtomicUsize::new(0)), last_ctrl_c: None, quit: false, snap: Snapshot::default(), menu: None, popup: None,
+            busy: Arc::new(AtomicUsize::new(0)), last_ctrl_c: None, quit: false, snap: Snapshot::default(), menu: None, popup: None, side_hidden: false,
         };
         if config::AppConfig::load().callsign.is_none() {
             app.wizard(first_run);
@@ -760,6 +762,11 @@ impl App {
                 self.push(&format!("  {}", list.join("   ")));
             }
         }
+    }
+
+    /// F8: show or hide the side panels.
+    pub fn toggle_side(&mut self) {
+        self.side_hidden = !self.side_hidden;
     }
 
     pub fn ctrl_c(&mut self) {
@@ -1015,7 +1022,7 @@ impl App {
         f.render_widget(Block::default().style(t.desktop), area);
         let rows = Layout::default().direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1), Constraint::Length(1)]).split(area);
-        let wide = area.width >= 100;
+        let wide = area.width >= 100 && !self.side_hidden;
         let body = Rect { x: rows[1].x + 2, width: rows[1].width.saturating_sub(4), ..rows[1] };
         let cols = Layout::default().direction(Direction::Horizontal)
             .constraints(if wide { vec![Constraint::Min(40), Constraint::Length(1), Constraint::Length(34)] } else { vec![Constraint::Min(40)] })
@@ -1031,10 +1038,10 @@ impl App {
         }
         if wide {
             let side = Layout::default().direction(Direction::Vertical)
-                .constraints([Constraint::Length(10), Constraint::Min(4), Constraint::Length(8)]).split(cols[2]);
+                .constraints([Constraint::Length(10), Constraint::Min(4)]).split(cols[2]);
             self.draw_panel(f, side[0], " RIG ", self.rig_lines(&t));
-            self.draw_panel(f, side[1], " HEARD ", self.heard_lines(&t));
-            self.draw_panel(f, side[2], " BBS ", self.bbs_lines(&t));
+            let (title, lines) = self.station_panel(&t);
+            self.draw_panel(f, side[1], &title.to_uppercase(), lines);
         }
         f.render_widget(Paragraph::new(self.status_line(wide)).style(t.panel), rows[2]);
         let masked = self.pending.as_ref().is_some_and(|p| p.secret);
@@ -1136,34 +1143,71 @@ impl App {
         ]
     }
 
-    fn heard_lines(&self, t: &Theme) -> Vec<Line<'static>> {
-        if self.snap.heard.is_empty() {
-            return vec![Line::from(Span::styled(" nothing heard yet", t.dim)), Line::from(Span::styled(" /listen to start", t.dim))];
+    /// The lower side panel: saved stations when idle, the live session while connecting or connected.
+    fn station_panel(&self, t: &Theme) -> (String, Vec<Line<'static>>) {
+        match &self.snap.session {
+            Some(s) => (format!(" Session: {} ", s.remote), self.session_lines(t, s)),
+            None => (" Stations ".into(), self.stations_lines(t)),
         }
-        self.snap.heard.iter().map(|h| Line::from(vec![
-            Span::styled(format!(" {:<10}", h.call), t.value),
-            Span::styled(format!("{} ", &engine::hhmmss(h.last_utc_secs)[..5]), t.dim),
-            Span::styled(format!("{:>3}x", h.count), t.label),
-            Span::styled(if h.v22 { " v2.2" } else { "" }.to_string(), t.good),
-        ])).collect()
     }
 
-    fn bbs_lines(&self, t: &Theme) -> Vec<Line<'static>> {
+    fn heard_of(&self, call: &str) -> Option<&engine::HeardEntry> {
+        self.snap.heard.iter().find(|h| crate::ax25::same_call(&h.call, call))
+    }
+
+    fn stations_lines(&self, t: &Theme) -> Vec<Line<'static>> {
         let all = config::load_bbs();
         if all.is_empty() {
             return vec![Line::from(Span::styled(" none saved", t.dim)), Line::from(Span::styled(" /bbs add", t.dim))];
         }
-        all.into_iter().map(|(name, b)| Line::from(vec![
-            Span::styled(format!(" {name:<10}"), t.value), Span::styled(format!("{:<9}", b.call), t.label),
-            Span::styled(format!("{:.3}", b.mhz), t.dim),
-        ])).collect()
+        let mut out = Vec::new();
+        for (name, b) in all {
+            out.push(Line::from(vec![
+                Span::styled(format!(" {name:<10}"), t.value), Span::styled(format!("{:<10}", b.call), t.label),
+                Span::styled(format!("{:.3}", b.mhz), t.dim),
+            ]));
+            let heard = match self.heard_of(&b.call) {
+                Some(h) => format!("heard {} ({}x)", &engine::hhmmss(h.last_utc_secs)[..5], h.count),
+                None => "not heard yet".into(),
+            };
+            let ver = b.ax25.as_deref().map(|v| format!(", AX.25 v{v}")).unwrap_or_default();
+            out.push(Line::from(Span::styled(format!("   {heard}{ver}"), t.dim)));
+        }
+        out
+    }
+
+    fn session_lines(&self, t: &Theme, s: &engine::SessionInfo) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        if let Some(n) = &s.name {
+            out.push(Self::row(t, "profile", n.clone(), t.value));
+        }
+        out.push(Self::row(t, "via", if s.path.is_empty() { "direct".into() } else { s.path.join(",") }, t.value));
+        if !s.connected {
+            out.push(Self::row(t, "state", "connecting".into(), t.warnv));
+            return out;
+        }
+        out.push(Self::row(t, "protocol", format!("AX.25 v{}", s.version), t.good));
+        out.push(Self::row(t, "frames", format!("{} B, {} in flight", s.paclen, s.window), t.value));
+        if let Some(since) = s.since_utc_secs {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(since);
+            let secs = now.saturating_sub(since);
+            out.push(Self::row(t, "connected", format!("{}:{:02}", secs / 60, secs % 60), t.value));
+        }
+        out.push(Self::row(t, "sent", format!("{} ({} B)", s.stats.sent, s.stats.bytes_out), t.value));
+        out.push(Self::row(t, "received", format!("{} ({} B)", s.stats.received, s.stats.bytes_in), t.value));
+        out.push(Self::row(t, "resent", s.stats.resent.to_string(), if s.stats.resent > 0 { t.warnv } else { t.value }));
+        out.push(Self::row(t, "unacked", s.unacked.to_string(), t.value));
+        if let Some(h) = self.heard_of(&s.remote) {
+            out.push(Self::row(t, "heard", format!("{}x, last {}", h.count, &engine::hhmmss(h.last_utc_secs)[..5]), t.value));
+        }
+        out
     }
 
     fn status_line(&self, wide: bool) -> Line<'static> {
         let t = &self.theme;
         let mut spans = Vec::new();
         if wide {
-            for (k, v) in [("Ctrl+C", "disconnect"), ("PgUp/PgDn", "scroll"), ("Tab", "complete"), ("/help", "commands"), ("Ctrl+Q", "quit")] {
+            for (k, v) in [("F8", "panels"), ("Ctrl+C", "disconnect"), ("PgUp/PgDn", "scroll"), ("Tab", "complete"), ("/help", "commands"), ("Ctrl+Q", "quit")] {
                 spans.push(Span::styled(format!(" {k} "), t.value.patch(t.panel)));
                 spans.push(Span::styled(format!("{v}  "), t.label.patch(t.panel)));
             }

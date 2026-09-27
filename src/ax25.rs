@@ -241,6 +241,20 @@ pub struct Station {
     /// Window and frame length in use, after any XID negotiation.
     window: usize,
     paclen: usize,
+    stats: LinkStats,
+}
+
+/// Counters for the current link, for display.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LinkStats {
+    /// I frames sent, including resends.
+    pub sent: u32,
+    /// I frames sent again after a loss.
+    pub resent: u32,
+    /// I frames received in order.
+    pub received: u32,
+    pub bytes_out: u64,
+    pub bytes_in: u64,
 }
 
 impl Station {
@@ -251,6 +265,7 @@ impl Station {
             txq: Vec::new(), rx: Vec::new(), t1_at: None, ack_at: None, retries: 0, rej_sent: false,
             remote_busy: false, connect_attempts: None, outbox: Vec::new(), events: Vec::new(),
             extended: false, sabme_pending: false, xid_pending: false, window: 0, paclen: 0,
+            stats: LinkStats::default(),
         }
     }
 
@@ -271,6 +286,21 @@ impl Station {
         self.xid_pending = false;
         self.window = self.cfg.window.clamp(1, 7);
         self.paclen = self.cfg.paclen;
+        self.stats = LinkStats::default();
+    }
+
+    pub fn stats(&self) -> &LinkStats {
+        &self.stats
+    }
+
+    /// Frames in flight (sent, not yet acknowledged).
+    pub fn unacked(&self) -> usize {
+        self.unacked.len()
+    }
+
+    /// Window and frame length in use, after any negotiation.
+    pub fn window_and_paclen(&self) -> (usize, usize) {
+        (self.window, self.paclen)
     }
 
     /// Link version in use: "2.2" (modulo 128) or "2.0".
@@ -514,6 +544,8 @@ impl Station {
         self.ack_to(nr, now);
         if ns == self.vr {
             self.rx.extend_from_slice(&fr.info);
+            self.stats.received += 1;
+            self.stats.bytes_in += fr.info.len() as u64;
             self.vr = (self.vr + 1) & self.mask();
             self.rej_sent = false;
             if pf {
@@ -566,6 +598,7 @@ impl Station {
     fn retransmit_from(&mut self, nr: u8, now: Instant) {
         let mut n = nr;
         while let Some(info) = self.unacked.get(&n).cloned() {
+            self.stats.resent += 1;
             self.send_i(n, &info);
             n = (n + 1) & self.mask();
         }
@@ -577,6 +610,7 @@ impl Station {
             let take = self.txq.len().min(self.paclen);
             let chunk: Vec<u8> = self.txq.drain(..take).collect();
             let vs = self.vs;
+            self.stats.bytes_out += chunk.len() as u64;
             self.send_i(vs, &chunk);
             self.unacked.insert(vs, chunk);
             self.vs = (self.vs + 1) & self.mask();
@@ -650,6 +684,7 @@ impl Station {
     }
 
     fn send_i(&mut self, ns: u8, info: &[u8]) {
+        self.stats.sent += 1;
         let (remote, path) = (self.remote.clone(), self.path.clone());
         let ctl = if self.extended { vec![ns << 1, self.vr << 1] } else { vec![(self.vr << 5) | (ns << 1)] };
         self.push_raw(&remote, &ctl, true, Some(PID_NONE), info, &path);

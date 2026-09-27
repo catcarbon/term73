@@ -218,7 +218,7 @@ impl App {
         }
         self.draw_menu_bar(f, area, &tv);
         // windows: main (and traffic while listening) on the left, rig / heard / BBS on the right
-        let wide = area.width >= 100;
+        let wide = area.width >= 100 && !self.side_hidden;
         let side_w = if wide { 34 } else { 0 };
         let left = Rect { x: desk.x + 1, y: desk.y, width: desk.width - side_w - 4, height: desk.height - 1 };
         let (main, traffic) = if self.snap.listening && left.height > 16 {
@@ -237,12 +237,11 @@ impl App {
             let sx = left.right() + 2;
             let st = &*tv.side_theme;
             let rig = Rect { x: sx, y: desk.y, width: side_w - 1, height: 10 };
-            let heard = Rect { y: rig.bottom() + 1, height: desk.height.saturating_sub(10 + 1 + 8 + 1 + 1).max(4), ..rig };
-            let bbs = Rect { y: heard.bottom() + 1, height: 8, ..rig };
-            for (r, title, lines) in [(rig, " Rig ", self.rig_lines(st)), (heard, " Heard ", self.heard_lines(st)),
-                                      (bbs, " BBS ", self.bbs_lines(st))] {
+            let lower = Rect { y: rig.bottom() + 1, height: desk.height.saturating_sub(10 + 1 + 1).max(4), ..rig };
+            let (title, lines) = self.station_panel(st);
+            for (r, title, lines) in [(rig, " Rig ".to_string(), self.rig_lines(st)), (lower, title, lines)] {
                 if r.bottom() < desk.bottom() {
-                    let inner = window(f, r, title, tv.side, tv.side_border, desk);
+                    let inner = window(f, r, &title, tv.side, tv.side_border, desk);
                     f.render_widget(Paragraph::new(lines).style(tv.side), inner);
                 }
             }
@@ -322,9 +321,9 @@ impl App {
         } else if self.menu.is_some() {
             &[("←→", "Menus"), ("↑↓", "Items"), ("Enter", "Choose"), ("Esc", "Close")]
         } else if self.snap.remote.is_some() {
-            &[("F1", "Help"), ("F10", "Menu"), ("Ctrl+C", "Disconnect"), ("Ctrl+Z", "End message"), ("PgUp", "Scroll"), ("Alt+X", "Exit")]
+            &[("F1", "Help"), ("F8", "Panels"), ("F10", "Menu"), ("Ctrl+C", "Disconnect"), ("Ctrl+Z", "End message"), ("PgUp", "Scroll"), ("Alt+X", "Exit")]
         } else {
-            &[("F1", "Help"), ("F10", "Menu"), ("Tab", "Complete"), ("PgUp", "Scroll"), ("Alt+X", "Exit")]
+            &[("F1", "Help"), ("F8", "Panels"), ("F10", "Menu"), ("Tab", "Complete"), ("PgUp", "Scroll"), ("Alt+X", "Exit")]
         };
         let mut spans = vec![Span::styled(" ", tv.menu)];
         for (k, v) in keys {
@@ -372,20 +371,21 @@ pub(super) fn window(f: &mut Frame, r: Rect, title: &str, body: Style, border: S
     inner
 }
 
-/// Turbo Vision shadow: two columns to the right and one row below, dimmed but still showing what is under it.
+/// A thin shadow: half a cell wide on the right and half a cell tall below, drawn with block
+/// elements in black over whatever is underneath, so that cell keeps its background.
 fn shadow(f: &mut Frame, r: Rect, clip: Rect) {
     let buf = f.buffer_mut();
-    let dim = |x: u16, y: u16, buf: &mut ratatui::buffer::Buffer| {
+    let mut put = |x: u16, y: u16, sym: &str| {
         if x < clip.right() && y < clip.bottom() && x >= clip.left() && y >= clip.top() {
-            buf[(x, y)].set_bg(Color::Black).set_fg(Color::DarkGray);
+            buf[(x, y)].set_symbol(sym).set_fg(Color::Black);
         }
     };
-    for y in r.y + 1..=r.bottom() {
-        for dx in 0..2 {
-            dim(r.right() + dx, y, buf);
-        }
+    put(r.right(), r.y, "\u{2596}"); // quadrant lower left: the shadow starts half a row down
+    for y in r.y + 1..r.bottom() {
+        put(r.right(), y, "\u{258C}"); // left half block
     }
-    for x in r.x + 2..r.right() {
-        dim(x, r.bottom(), buf);
+    put(r.right(), r.bottom(), "\u{2598}"); // quadrant upper left
+    for x in r.x + 1..r.right() {
+        put(x, r.bottom(), "\u{2580}"); // upper half block
     }
 }
