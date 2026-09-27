@@ -374,3 +374,25 @@ fn watch_reports_changed_fields() {
     std::thread::sleep(std::time::Duration::from_millis(2500));
     assert_eq!(rig.radio.lock().unwrap().cat_log.iter().filter(|l| l.as_str() == "FO 1").count(), reads, "no reads after stopping");
 }
+
+/// /connect to a saved BBS's callsign uses its frequency; nothing connects on an APRS channel.
+#[test]
+fn connect_uses_saved_bbs_and_avoids_aprs() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("connect-bbs");
+    let mut saved = std::collections::BTreeMap::new();
+    saved.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200 });
+    config::save_bbs(&saved).unwrap();
+    rig.radio.lock().unwrap().freq[1] = 144_390_000; // left on the APRS channel
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.h().send(Job::SetCallsign("n0call".into()));
+    rig.h().send(Job::SetTransmit(true));
+    rig.wait_for("TM-D750, data band B 144.390 MHz", None);
+    rig.h().send(Job::Connect("N0XYZ".into(), vec![]));
+    rig.wait_for("the APRS channel", None);
+    assert!(rig.radio.lock().unwrap().to_air.is_empty(), "nothing was transmitted on the APRS channel");
+    rig.h().send(Job::Connect("node1".into(), vec![]));
+    rig.wait_for("using saved BBS node1 (145.030 MHz)", None);
+    rig.wait_for("*** connecting to NODE1", None);
+    assert_eq!(rig.radio.lock().unwrap().freq[1], 145_030_000);
+}

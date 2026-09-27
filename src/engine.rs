@@ -246,6 +246,10 @@ struct Engine {
     running: bool,
 }
 
+/// APRS channels; term73 will not start a connected session on them.
+/// 144.390 North America, 144.800 Europe and Africa, 145.175 Australia, 145.825 the ISS digipeater.
+const APRS_MHZ: &[f64] = &[144.390, 144.800, 145.175, 145.825];
+
 fn now_utc_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -395,7 +399,21 @@ impl Engine {
                 self.cfg.save().map_err(|e| e.to_string())?;
                 self.say(format!("grid {g} saved"));
             }
-            Job::Connect(call, path) => self.connect(&call, &path, None)?,
+            Job::Connect(call, path) => {
+                // a saved BBS brings its own frequency, power and speed
+                let saved = config::load_bbs().into_iter()
+                    .find(|(name, b)| b.call.eq_ignore_ascii_case(&call) || name.eq_ignore_ascii_case(&call));
+                match saved {
+                    Some((name, mut b)) => {
+                        if !path.is_empty() {
+                            b.path = path;
+                        }
+                        self.say(format!("using saved BBS {name} ({:.3} MHz)", b.mhz));
+                        self.bbs_connect_to(b)?;
+                    }
+                    None => self.connect(&call, &path, None)?,
+                }
+            }
             Job::SendLine(text) => {
                 let st = self.station.as_mut().filter(|s| s.state == State::Connected && self.bridge.is_none())
                     .ok_or("not connected")?;
@@ -717,6 +735,10 @@ impl Engine {
         if self.session_active() {
             return Err("already connected: /disconnect first".into());
         }
+        if let Some(f) = self.freq
+            && APRS_MHZ.iter().any(|a| (f - a).abs() < 0.005) {
+                return Err(format!("the radio is on {f:.3} MHz, the APRS channel, where connected sessions disrupt APRS: tune elsewhere first (/frequency) or use a saved BBS"));
+            }
         self.enter_kiss()?;
         let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config());
         st.connect(call, path, attempts.or(Some(3)), Instant::now());
@@ -730,8 +752,15 @@ impl Engine {
 
     fn bbs_connect(&mut self, name: &str) -> Result<(), String> {
         let b = config::load_bbs().get(name).cloned().ok_or(format!("no saved BBS {name:?}: /bbs list"))?;
+        self.bbs_connect_to(b)
+    }
+
+    fn bbs_connect_to(&mut self, b: config::Bbs) -> Result<(), String> {
         self.need_rig()?;
         self.need_tx()?;
+        if self.session_active() {
+            return Err("already connected: /disconnect first".into());
+        }
         self.tune(b.mhz)?;
         self.power(self.prof.power_high.unwrap_or(0))?;
         self.enter_kiss()?;
