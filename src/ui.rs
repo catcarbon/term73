@@ -1038,7 +1038,7 @@ impl App {
         }
         if wide {
             let side = Layout::default().direction(Direction::Vertical)
-                .constraints([Constraint::Length(10), Constraint::Min(4)]).split(cols[2]);
+                .constraints([Constraint::Length(8), Constraint::Min(4)]).split(cols[2]);
             self.draw_panel(f, side[0], " RIG ", self.rig_lines(&t));
             let (title, lines) = self.station_panel(&t);
             self.draw_panel(f, side[1], &title.to_uppercase(), lines);
@@ -1124,22 +1124,19 @@ impl App {
         let Some(model) = s.model.clone() else {
             return vec![Self::row(t, "rig", "none".into(), t.value), Line::from(Span::styled(" /radio scan to find one", t.dim))];
         };
-        let packet = match s.packet {
-            Packet::Idle => "idle",
-            Packet::Ready => "packet mode",
-            Packet::Listening => "listening",
-            Packet::Connecting => "connecting",
-            Packet::Connected => "connected",
+        // rig state only; sessions, listening and Winlink belong to the Stations/Session panel
+        let tnc = match (s.software_modem, s.packet) {
+            (true, _) => "software modem",
+            (false, Packet::Idle) => "command mode",
+            (false, _) => "packet (KISS)",
         };
         vec![
             Self::row(t, "rig", model, t.value),
             Self::row(t, "address", s.address.clone().unwrap_or_default(), t.value),
             Self::row(t, "profile", if s.profile_saved { "saved".into() } else { "none".into() }, if s.profile_saved { t.value } else { t.warnv }),
             Self::row(t, "frequency", s.freq_mhz.map(|f| format!("{f:.3} MHz")).unwrap_or("?".into()), t.value),
-            Self::row(t, "packet", packet.into(), if s.packet == Packet::Idle { t.value } else { t.good }),
-            Self::row(t, "with", s.remote.clone().unwrap_or("-".into()), t.value),
+            Self::row(t, "TNC", tnc.into(), if s.packet == Packet::Idle { t.value } else { t.good }),
             Self::row(t, "transmit", if s.transmit_allowed { "ALLOWED".into() } else { "off".into() }, if s.transmit_allowed { t.tx } else { t.value }),
-            Self::row(t, "winlink", if s.winlink_ready { "ready".into() } else { "off".into() }, if s.winlink_ready { t.good } else { t.value }),
         ]
     }
 
@@ -1156,11 +1153,19 @@ impl App {
     }
 
     fn stations_lines(&self, t: &Theme) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        if self.snap.listening {
+            out.push(Line::from(Span::styled(" listening to the channel", t.good)));
+        }
+        if self.snap.winlink_ready {
+            out.push(Line::from(Span::styled(" Winlink: waiting for a client on 127.0.0.1:8772", t.good)));
+        }
         let all = config::load_bbs();
         if all.is_empty() {
-            return vec![Line::from(Span::styled(" none saved", t.dim)), Line::from(Span::styled(" /bbs add", t.dim))];
+            out.push(Line::from(Span::styled(" none saved", t.dim)));
+            out.push(Line::from(Span::styled(" /bbs add", t.dim)));
+            return out;
         }
-        let mut out = Vec::new();
         for (name, b) in all {
             out.push(Line::from(vec![
                 Span::styled(format!(" {name:<10}"), t.value), Span::styled(format!("{:<10}", b.call), t.label),

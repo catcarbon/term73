@@ -236,8 +236,8 @@ impl App {
         if wide {
             let sx = left.right() + 2;
             let st = &*tv.side_theme;
-            let rig = Rect { x: sx, y: desk.y, width: side_w - 1, height: 10 };
-            let lower = Rect { y: rig.bottom() + 1, height: desk.height.saturating_sub(10 + 1 + 1).max(4), ..rig };
+            let rig = Rect { x: sx, y: desk.y, width: side_w - 1, height: 8 };
+            let lower = Rect { y: rig.bottom() + 1, height: desk.height.saturating_sub(8 + 1 + 1).max(4), ..rig };
             let (title, lines) = self.station_panel(st);
             for (r, title, lines) in [(rig, " Rig ".to_string(), self.rig_lines(st)), (lower, title, lines)] {
                 if r.bottom() < desk.bottom() {
