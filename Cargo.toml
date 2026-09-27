@@ -1,0 +1,20 @@
+[package]
+name = "term73"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+crossterm = "0.28"
+dirs = "7.0.0"
+ratatui = "0.29"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serialport = { version = "4", default-features = false }
+ureq = "2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Devices_Bluetooth", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_Registry"] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

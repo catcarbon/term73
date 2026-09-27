@@ -1,0 +1,8 @@
+*.jsonl
+*.pyc
+/target
+__pycache__/
+logs/
+probe-*.json
+profiles/
+tools/tui-preview.html
