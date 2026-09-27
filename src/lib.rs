@@ -10,6 +10,7 @@ pub mod engine;
 pub mod gateways;
 pub mod kiss;
 pub mod link;
+pub mod rigctld;
 pub mod rmslist;
 pub mod signals;
 pub mod softmodem;

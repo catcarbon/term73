@@ -22,7 +22,8 @@ use crate::discover::{self, Discovery};
 use crate::gateways::{self, Candidate};
 use crate::kiss;
 use crate::link::{Link, SerialLink, TcpLink};
-use crate::softmodem::{ModemControl, RigServer};
+use crate::rigctld;
+use crate::softmodem::ModemControl;
 
 /// Text for the user: the main pane, or the traffic pane while listening.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +126,9 @@ pub enum Job {
     CurrentProfile(Reply<(Option<String>, RadioProfile)>),
     Ptt(bool, Reply<bool>),
     FreqHz(Reply<u64>),
+    /// A Hamlib rigctld request from the rig-control server.
+    Rig(rigctld::Req, Sender<Result<rigctld::Resp, i32>>),
+    RigCaps(Sender<rigctld::Caps>),
     /// Stop: end any session (waiting at most this long for the station), leave packet mode, release the rig.
     Shutdown(Duration),
 }
@@ -238,7 +242,7 @@ struct Engine {
     heard: BTreeMap<String, HeardEntry>,
     bridge_listener: Option<(Arc<std::sync::atomic::AtomicBool>, u16)>,
     bridge: Option<BridgeSession>,
-    rigserver: Option<RigServer>,
+    rigserver: Option<rigctld::Server>,
     keyed_at: Option<Instant>,
     ptt_max: Duration,
     close_wait: Duration,
@@ -486,6 +490,13 @@ impl Engine {
             Job::FreqHz(reply) => {
                 let r = self.freq_hz();
                 let _ = reply.send(r);
+            }
+            Job::Rig(r, reply) => {
+                let a = self.rig_request(r);
+                let _ = reply.send(a);
+            }
+            Job::RigCaps(reply) => {
+                let _ = reply.send(self.rig_caps());
             }
             Job::Shutdown(wait) => {
                 self.close_wait = wait;
@@ -992,28 +1003,99 @@ impl Engine {
         if self.rigserver.is_some() {
             return Err("rigctl server already running".into());
         }
-        let jobs = Arc::new(Mutex::new(self.self_jobs.clone()));
-        let (j1, j2, j3) = (jobs.clone(), jobs.clone(), jobs.clone());
+        let (j1, j2) = (Arc::new(Mutex::new(self.self_jobs.clone())), Arc::new(Mutex::new(self.self_jobs.clone())));
         let out = self.out.clone();
-        let call = move |jobs: &Arc<Mutex<Sender<Job>>>, make: Box<dyn FnOnce(Reply<bool>) -> Job>| -> bool {
+        let handler = move |r: rigctld::Req| -> Result<rigctld::Resp, i32> {
             let (tx, rx) = mpsc::channel();
-            let _ = jobs.lock().unwrap().send(make(tx));
-            rx.recv_timeout(Duration::from_secs(10)).ok().and_then(|r| r.ok()).unwrap_or(false)
+            let _ = j1.lock().unwrap().send(Job::Rig(r, tx));
+            rx.recv_timeout(Duration::from_secs(10)).unwrap_or(Err(rigctld::ENAVAIL))
         };
-        let srv = RigServer::start(
-            port,
-            Arc::new(move |on| call(&j1, Box::new(move |tx| Job::Ptt(on, tx)))),
-            Arc::new(move || {
-                let (tx, rx) = mpsc::channel();
-                let _ = j2.lock().unwrap().send(Job::FreqHz(tx));
-                rx.recv_timeout(Duration::from_secs(10)).ok().and_then(|r| r.ok())
-            }),
-            Arc::new(move |hz| j3.lock().unwrap().send(Job::Tune(hz as f64 / 1e6)).is_ok()),
-            Arc::new(move |m| { let _ = out.send(Out::Main(m)); }),
-        ).map_err(|e| e.to_string())?;
-        self.say(format!("rigctl server on 127.0.0.1:{} (point the modem's rigctl PTT here)", srv.port));
+        let caps = move || {
+            let (tx, rx) = mpsc::channel();
+            let _ = j2.lock().unwrap().send(Job::RigCaps(tx));
+            rx.recv_timeout(Duration::from_secs(10)).unwrap_or(rigctld::Caps {
+                model: "term73 (no rig)".into(), rx: vec![], tx: vec![], ptt: false, power: false,
+            })
+        };
+        let srv = rigctld::Server::start(port, Arc::new(handler), Arc::new(caps),
+                                         Arc::new(move |m| { let _ = out.send(Out::Main(m)); }))
+            .map_err(|e| e.to_string())?;
+        self.say(format!("rigctl server on 127.0.0.1:{} (Hamlib NET rigctl; modem73 PTT, WSJT-X, Gpredict)", srv.port));
         self.rigserver = Some(srv);
         Ok(())
+    }
+
+    fn rig_caps(&self) -> rigctld::Caps {
+        let model = self.model.clone().unwrap_or_else(|| "unknown".into());
+        let bands = self.prof.bands_mhz.clone().unwrap_or_else(|| gateways::default_bands(&model));
+        let hz: Vec<(u64, u64)> = bands.iter().map(|(a, b)| ((a * 1e6).round() as u64, (b * 1e6).round() as u64)).collect();
+        rigctld::Caps {
+            model: format!("term73 {model}"),
+            rx: hz.clone(),
+            tx: hz,
+            ptt: self.radio.is_some() && self.prof.ptt_verified == Some(true),
+            power: self.radio.is_some() && self.modem.is_none(),
+        }
+    }
+
+    /// One Hamlib request. Rig-control reads are impossible while the radio's TNC is in packet mode,
+    /// so the last known value is used then.
+    fn rig_request(&mut self, r: rigctld::Req) -> Result<rigctld::Resp, i32> {
+        use rigctld::{Req, Resp, ENAVAIL, ERJCTED, EINVAL};
+        if self.radio.is_none() && self.modem.is_none() {
+            return Err(ENAVAIL);
+        }
+        let cat_ok = self.radio.is_some() && !self.kiss;
+        match r {
+            Req::GetFreq if cat_ok => self.freq_hz().map(Resp::Freq).map_err(|_| ENAVAIL),
+            Req::GetFreq => self.freq.map(|f| Resp::Freq((f * 1e6).round() as u64)).ok_or(ENAVAIL),
+            Req::SetFreq(hz) => {
+                if self.session_active() {
+                    return Err(ERJCTED);
+                }
+                if !self.rig_caps().rx.iter().any(|&(lo, hi)| (lo..=hi).contains(&hz)) {
+                    self.say(format!("rigctl: {:.3} MHz is outside this rig's bands", hz as f64 / 1e6));
+                    return Err(EINVAL);
+                }
+                self.tune(hz as f64 / 1e6).map(|_| Resp::Done).map_err(|e| {
+                    self.say(format!("rigctl: {e}"));
+                    EINVAL
+                })
+            }
+            Req::GetMode if self.modem.is_some() => Err(ENAVAIL),
+            Req::GetMode if cat_ok => {
+                let band = self.band;
+                let r = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("MD {band}"), Duration::from_secs(2), false)
+                    .unwrap_or_default();
+                if r == format!("MD {band},0") { Ok(Resp::Mode("FM", 15000)) } else { Err(ENAVAIL) }
+            }
+            Req::GetMode => Ok(Resp::Mode("FM", 15000)), // term73 only enters packet mode after tuning FM
+            Req::GetVfo => Ok(Resp::Band(self.band)),
+            Req::GetPtt => Ok(Resp::Flag(self.keyed_at.is_some())),
+            Req::SetPtt(on) => match self.ptt(on) {
+                Ok(true) => Ok(Resp::Done),
+                _ => Err(ERJCTED),
+            },
+            Req::GetDcd if cat_ok => {
+                let band = self.band;
+                let r = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("BY {band}"), Duration::from_secs(2), false)
+                    .unwrap_or_default();
+                match r.strip_prefix(&format!("BY {band},")) {
+                    Some("0") => Ok(Resp::Flag(false)),
+                    Some("1") => Ok(Resp::Flag(true)),
+                    _ => Err(ENAVAIL),
+                }
+            }
+            Req::GetPower if cat_ok => gateways::get_power(self.radio.as_deref_mut().unwrap(), self.band)
+                .map(|l| Resp::Level(rigctld::level_to_fraction(l))).map_err(|_| ENAVAIL),
+            Req::SetPower(f) if self.modem.is_none() => {
+                if self.session_active() {
+                    return Err(ERJCTED);
+                }
+                self.power(rigctld::fraction_to_level(f)).map(|_| Resp::Done).map_err(|_| EINVAL)
+            }
+            _ => Err(ENAVAIL),
+        }
     }
 
     fn ptt(&mut self, on: bool) -> Result<bool, String> {

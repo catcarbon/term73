@@ -87,6 +87,10 @@ term73 answers the telnet login itself, connects to the nearest gateway over the
 
 modem73 is found by `/radio scan` when it is running (control port 8073, KISS port 8001) and can be selected like a radio. term73 then sends its packets through modem73, and tunes through modem73's own rig control when that is set up.
 
+## Rig control for other programs
+
+`/advanced rigctl start` runs a server on `127.0.0.1:4532` that speaks Hamlib's rigctld protocol. Programs that support "Hamlib NET rigctl" (for example WSJT-X, Gpredict or fldigi) can then read and set the frequency, read the mode and band, set the power (high, mid, low) and read the busy signal through term73, including for radios Hamlib itself does not support, such as the TM-D750. Transmit (PTT) is only offered once keying has been verified for the radio and `/transmit on` is set. Anything not yet confirmed for the radio answers "not available".
+
 ## Configuration
 
 - Windows: `%APPDATA%\term73`

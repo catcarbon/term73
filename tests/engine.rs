@@ -396,3 +396,36 @@ fn connect_uses_saved_bbs_and_avoids_aprs() {
     rig.wait_for("*** connecting to NODE1", None);
     assert_eq!(rig.radio.lock().unwrap().freq[1], 145_030_000);
 }
+
+/// The Hamlib-compatible server answers from the real engine: frequency, band limits, power, and a refused PTT.
+#[test]
+fn rigctl_server_drives_the_engine() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("rigctl");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    rig.h().send(Job::RigctlStart(0));
+    rig.wait_for("rigctl server on 127.0.0.1:", None);
+    let port: u16 = rig.text.split("rigctl server on 127.0.0.1:").nth(1).unwrap()
+        .split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap();
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let mut ask = |line: &str, lines: usize| {
+        c.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let mut got = String::new();
+        let mut b = [0u8; 1];
+        while got.matches('\n').count() < lines {
+            c.read_exact(&mut b).unwrap();
+            got.push(b[0] as char);
+        }
+        got
+    };
+    assert_eq!(ask("f", 1), "145030000\n");
+    assert_eq!(ask("F 146520000", 1), "RPRT 0\n");
+    assert_eq!(ask("F 7074000", 1), "RPRT -1\n", "outside the rig's bands");
+    assert_eq!(ask("l RFPOWER", 1), "0.200000\n");
+    assert_eq!(ask("T 1", 1), "RPRT -9\n", "transmit is not allowed");
+    assert!(ask(r"\dump_state", 1).starts_with('1'));
+    assert_eq!(rig.radio.lock().unwrap().freq[1], 146_520_000);
+    assert!(!rig.radio.lock().unwrap().keyed);
+}

@@ -64,7 +64,7 @@ While connected, / lines that are not term73 commands (like /EX) go to the stati
 /advanced kiss on|off         switch the radio's TNC by hand
 /advanced modem status        software modem state (control port)
 /advanced modem set key=value ...
-/advanced rigctl start [port] | stop   let a software modem key this radio through rig control"),
+/advanced rigctl start [port] | stop   Hamlib-compatible rig control on 127.0.0.1 (default 4532) for modem73, WSJT-X, Gpredict"),
 ];
 const BASIC: &[&str] = &["basics", "bbs", "winlink", "radio", "settings"];
 
