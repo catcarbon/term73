@@ -59,8 +59,8 @@ fn main() {
     unsafe { std::env::set_var("TERM73_HOME", &home.0) };
     AppConfig { callsign: Some("N0CALL".into()), grid: Some("FN31pr".into()), winlink_api_key: None }.save().unwrap();
     let mut bbs = std::collections::BTreeMap::new();
-    bbs.insert("bbs3".to_string(), Bbs { call: "N0BBS-3".into(), mhz: 145.03, path: vec!["N0DIGI-2".into()], baud: 1200 });
-    bbs.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200 });
+    bbs.insert("bbs3".to_string(), Bbs { call: "N0BBS-3".into(), mhz: 145.03, path: vec!["N0DIGI-2".into()], baud: 1200, ax25: None });
+    bbs.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
     config::save_bbs(&bbs).unwrap();
     config::save_radio("COM10", &RadioProfile { data_band: Some(1), shift_field: Some(11), ..Default::default() }).unwrap();
     let radio = Arc::new(Mutex::new(Radio { freq: [146_850_000, 145_030_000], power: [1, 2], ..Default::default() }));

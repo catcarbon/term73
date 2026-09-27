@@ -240,6 +240,10 @@ struct Engine {
     station: Option<Station>,
     rx_cr: bool,
     watch: Option<Watch>,
+    /// AX.25 version each station used this session (saved BBSes also keep it in their profile).
+    ax25_seen: BTreeMap<String, &'static str>,
+    /// The current session's version has been recorded.
+    ax25_noted: bool,
     closing: bool,
     heard: BTreeMap<String, HeardEntry>,
     bridge_listener: Option<(Arc<std::sync::atomic::AtomicBool>, u16)>,
@@ -271,7 +275,7 @@ impl Engine {
         let e = Engine {
             out, snap, opener, self_jobs, cfg, target: None, radio: None, modem: None, ctl: None, model: None,
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
-            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, watch: None, closing: false,
+            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
             ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, running: true,
         };
@@ -733,12 +737,32 @@ impl Engine {
 
     // ------------------------------------------------------------ sessions
 
-    fn ax_config(&self) -> AxConfig {
+    /// Link settings for a connection to `remote`: try AX.25 v2.2 unless the station is known to be v2.0.
+    fn ax_config(&self, remote: &str) -> AxConfig {
+        let known = self.ax25_seen.iter().find(|(c, _)| ax25::same_call(c, remote)).map(|(_, v)| v.to_string())
+            .or_else(|| config::load_bbs().into_values().find(|b| ax25::same_call(&b.call, remote)).and_then(|b| b.ax25));
         AxConfig {
             t1: Duration::from_secs_f64(self.prof.t1.unwrap_or(10.0)),
             paclen: self.prof.paclen.unwrap_or(128),
             window: self.prof.window.unwrap_or(4),
+            v22: known.as_deref() != Some("2.0"),
             ..AxConfig::default()
+        }
+    }
+
+    /// Remember which AX.25 version a station used, and store it in matching saved BBS entries.
+    fn note_ax25_version(&mut self, remote: &str, version: &'static str) {
+        self.ax25_seen.insert(remote.to_ascii_uppercase(), version);
+        let mut all = config::load_bbs();
+        let mut changed = false;
+        for b in all.values_mut().filter(|b| ax25::same_call(&b.call, remote)) {
+            if b.ax25.as_deref() != Some(version) {
+                b.ax25 = Some(version.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = config::save_bbs(&all);
         }
     }
 
@@ -753,7 +777,8 @@ impl Engine {
                 return Err(format!("the radio is on {f:.3} MHz, the APRS channel, where connected sessions disrupt APRS: tune elsewhere first (/frequency) or use a saved BBS"));
             }
         self.enter_kiss()?;
-        let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config());
+        let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config(call));
+        self.ax25_noted = false;
         st.connect(call, path, attempts.or(Some(3)), Instant::now());
         self.station = Some(st);
         self.rx_cr = false;
@@ -810,8 +835,8 @@ impl Engine {
                 let hex: String = f.iter().map(|b| format!("{b:02x}")).collect();
                 let _ = writeln!(rec, "{}", serde_json::json!({"utc_secs": now_utc_secs(), "raw": hex, "decoded": line}));
             }
-            if let (Some(st), Some(fr)) = (self.station.as_mut(), ax25::parse(raw)) {
-                st.on_frame(&fr, now);
+            if let Some(st) = self.station.as_mut() {
+                st.on_raw(raw, now);
             }
         }
         let Some(st) = self.station.as_mut() else { return Ok(()) };
@@ -820,6 +845,11 @@ impl Engine {
         let got = st.recv();
         let events = st.take_events();
         let state = st.state;
+        let learned = (state == State::Connected && !self.ax25_noted).then(|| (st.remote.clone(), st.version()));
+        if let Some((remote, version)) = learned {
+            self.ax25_noted = true;
+            self.note_ax25_version(&remote, version);
+        }
         for raw in outbox {
             let f = kiss::frame(kiss::cmd::DATA, &raw, 0);
             self.tnc_write(&f);
@@ -981,7 +1011,8 @@ impl Engine {
             match prepared {
                 Ok(()) => {
                     self.set_speed(gw.baud);
-                    let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config());
+                    let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config(&gw.call));
+                    self.ax25_noted = false;
                     st.connect(&gw.call, &[], Some(3), Instant::now());
                     self.station = Some(st);
                     self.rx_cr = false;

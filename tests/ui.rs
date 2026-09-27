@@ -177,8 +177,8 @@ fn turbo_popups_build_commands() {
     unsafe { std::env::set_var("TERM73_HOME", &home.0) };
     term73::config::AppConfig { callsign: Some("N0CALL".into()), ..Default::default() }.save().unwrap();
     let mut bbs = std::collections::BTreeMap::new();
-    bbs.insert("bbs3".to_string(), term73::config::Bbs { call: "N0BBS-3".into(), mhz: 145.03, path: vec![], baud: 1200 });
-    bbs.insert("node1".to_string(), term73::config::Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200 });
+    bbs.insert("bbs3".to_string(), term73::config::Bbs { call: "N0BBS-3".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
+    bbs.insert("node1".to_string(), term73::config::Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
     term73::config::save_bbs(&bbs).unwrap();
     let fail = || std::io::Error::other("no radio in this test");
     let mut app = App::new(Theme::turbo(), Box::new(move |_t: &Target| Err(fail())), Arc::new(move |_t: &Target| Err(fail())));

@@ -229,7 +229,7 @@ fn engine_end_to_end() {
     {
         let mut rig = Rig::new("bbsprofile");
         let mut all = std::collections::BTreeMap::new();
-        all.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200 });
+        all.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
         config::save_bbs(&all).unwrap();
         let mut node = bbs("NODE1");
         rig.h().send(Job::Open(Target::Serial("COM10".into())));
@@ -304,7 +304,7 @@ fn modem73_as_rig() {
     });
     config::save_radio(&kiss_addr, &RadioProfile { tune_via_modem: Some(true), t1: Some(0.5), ..Default::default() }).unwrap();
     let mut all = std::collections::BTreeMap::new();
-    all.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200 });
+    all.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
     config::save_bbs(&all).unwrap();
     let (tx, rx) = mpsc::channel();
     let h = engine::spawn(tx, engine::real_opener());
@@ -381,7 +381,7 @@ fn connect_uses_saved_bbs_and_avoids_aprs() {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let mut rig = Rig::new("connect-bbs");
     let mut saved = std::collections::BTreeMap::new();
-    saved.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200 });
+    saved.insert("node1".to_string(), Bbs { call: "NODE1".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
     config::save_bbs(&saved).unwrap();
     rig.radio.lock().unwrap().freq[1] = 144_390_000; // left on the APRS channel
     rig.h().send(Job::Open(Target::Serial("COM10".into())));
@@ -448,4 +448,41 @@ fn listen_labels_v22_frames() {
     let heard = rig.h().snap.lock().unwrap().heard.clone();
     assert!(heard.iter().any(|h| h.call == "N1XYZ-7" && h.v22));
     assert!(heard.iter().any(|h| h.call == "NODE1" && !h.v22));
+}
+
+/// A v2.0-only BBS: the first connect falls back from v2.2, the BBS entry remembers "2.0",
+/// and the next connect goes straight to v2.0 (a plain SABM first).
+#[test]
+fn bbs_remembers_its_ax25_version() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("ax25ver");
+    let mut saved = std::collections::BTreeMap::new();
+    saved.insert("bbs3".to_string(), Bbs { call: "N0BBS-3".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
+    config::save_bbs(&saved).unwrap();
+    let mut b = bbs("N0BBS-3");
+    b.cfg.v22 = false; // answers SABME with DM, like many v2.0 TNCs
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.h().send(Job::SetCallsign("n0call".into()));
+    rig.h().send(Job::SetTransmit(true));
+    rig.h().send(Job::BbsConnect("bbs3".into()));
+    rig.wait_for("does not use AX.25 v2.2", Some(&mut b));
+    rig.wait_for("connected to N0BBS-3 (AX.25 v2.0)", Some(&mut b));
+    assert_eq!(config::load_bbs()["bbs3"].ax25.as_deref(), Some("2.0"));
+    rig.h().send(Job::Disconnect);
+    rig.wait_for("*** session closed", Some(&mut b));
+    rig.text.clear();
+    rig.radio.lock().unwrap().to_air.clear();
+    rig.h().send(Job::BbsConnect("bbs3".into()));
+    rig.wait_for("*** connecting to N0BBS-3", None);
+    let end = Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        if let Some(f) = rig.radio.lock().unwrap().to_air.first().cloned() {
+            break f;
+        }
+        assert!(Instant::now() < end, "nothing sent");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(ax25::parse(&first).unwrap().ctl & !ax25::PF, ax25::SABM, "straight to v2.0");
+    rig.wait_for("connected to N0BBS-3 (AX.25 v2.0)", Some(&mut b));
+    assert!(!rig.text.contains("does not use AX.25 v2.2"));
 }

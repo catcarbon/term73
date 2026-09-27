@@ -487,7 +487,9 @@ fn bbs_flow(c: &Ctx, existing: Option<(String, Bbs)>) -> Result<(), Cancelled> {
         all.remove(old_name);
     }
     let via = if path.is_empty() { String::new() } else { format!(" via {}", path.join(",")) };
-    all.insert(name.clone(), Bbs { call: call.clone(), mhz, path, baud });
+    // a new callsign may be a different station, so its AX.25 version is learned again
+    let ax25 = old.filter(|(_, b)| b.call == call).and_then(|(_, b)| b.ax25.clone());
+    all.insert(name.clone(), Bbs { call: call.clone(), mhz, path, baud, ax25 });
     match config::save_bbs(&all) {
         Ok(()) => c.say(format!("saved BBS {name}: {call} on {mhz:.3} MHz{via}, {baud} baud")),
         Err(e) => c.say(format!("error: {e}")),
@@ -937,7 +939,8 @@ impl App {
                     }
                     for (name, b) in all {
                         let via = if b.path.is_empty() { String::new() } else { format!(" via {}", b.path.join(",")) };
-                        self.push(&format!("  {name:12} {:10} {:8.3} MHz {} baud{via}", b.call, b.mhz, b.baud));
+                        let ver = b.ax25.as_deref().map(|v| format!(", AX.25 v{v}")).unwrap_or_default();
+                        self.push(&format!("  {name:12} {:10} {:8.3} MHz {} baud{via}{ver}", b.call, b.mhz, b.baud));
                     }
                 }
                 "connect" => e.send(Job::BbsConnect(arg(0)?.to_string())),

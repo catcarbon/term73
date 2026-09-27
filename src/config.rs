@@ -109,6 +109,9 @@ pub struct Bbs {
     pub path: Vec<String>,
     #[serde(default = "default_baud")]
     pub baud: u32,
+    /// AX.25 version learned on the last connect ("2.2" or "2.0"); None until the first connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ax25: Option<String>,
 }
 
 fn default_baud() -> u32 {

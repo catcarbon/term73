@@ -25,13 +25,13 @@ fn step(a: &mut Station, b: &mut Station, now: Instant, rng: &mut Rng, loss: f64
     for raw in a.take_outbox() {
         sent.0 += 1;
         if rng.next() >= loss {
-            b.on_frame(&parse(&raw).unwrap(), now);
+            b.on_raw(&raw, now);
         }
     }
     for raw in b.take_outbox() {
         sent.1 += 1;
         if rng.next() >= loss {
-            a.on_frame(&parse(&raw).unwrap(), now);
+            a.on_raw(&raw, now);
         }
     }
 }
@@ -101,8 +101,10 @@ fn connect_attempts_limit() {
         a.poll(clock);
         sabms += a.take_outbox().len();
     }
-    assert_eq!(sabms, 3);
-    assert!(a.take_events().iter().any(|e| e.contains("after 3 attempts")));
+    assert_eq!(sabms, 4, "one v2.2 SABME, then three v2.0 SABMs");
+    let ev = a.take_events();
+    assert!(ev.iter().any(|e| e.contains("trying v2.0")), "{ev:?}");
+    assert!(ev.iter().any(|e| e.contains("after 3 attempts")), "{ev:?}");
 }
 
 #[test]
@@ -117,4 +119,103 @@ fn refused_connection() {
     let mut sent = (0, 0);
     run_until(&mut a, &mut b, &mut clock, &mut rng, 0.0, &mut sent, |a, _| a.state == State::Disconnected);
     assert!(a.take_events().iter().any(|e| e.contains("refused")));
+}
+
+// ------------------------------------------------------------------ AX.25 v2.2 negotiation
+
+/// Connect `a` to `b`, then move `n` bytes each way over a link that loses `loss` of all frames.
+/// `drop_sabme` makes `b` behave like a v2.0 station that ignores SABME entirely.
+fn session(mut a: Station, mut b: Station, n: u32, loss: f64, seed: u64, drop_sabme: bool) -> (Station, Station) {
+    let mut clock = Instant::now();
+    let mut rng = Rng(seed);
+    b.listen = true;
+    a.connect(&b.mycall.clone(), &[], None, clock);
+    let pump = |a: &mut Station, b: &mut Station, clock: Instant, rng: &mut Rng| {
+        a.poll(clock);
+        b.poll(clock);
+        for raw in a.take_outbox() {
+            let sabme = parse(&raw).is_some_and(|f| f.ctl & !term73::ax25::PF == term73::ax25::SABME);
+            if rng.next() >= loss && !(drop_sabme && sabme) {
+                b.on_raw(&raw, clock);
+            }
+        }
+        for raw in b.take_outbox() {
+            if rng.next() >= loss {
+                a.on_raw(&raw, clock);
+            }
+        }
+    };
+    let up: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+    let down: Vec<u8> = (0..n / 2).map(|i| (i * 13 + 1) as u8).collect();
+    let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+    let mut sent = false;
+    for _ in 0..400_000 {
+        if a.state == State::Connected && b.state == State::Connected && !sent {
+            a.send(&up);
+            b.send(&down);
+            sent = true;
+        }
+        got_b.extend(b.recv());
+        got_a.extend(a.recv());
+        if sent && got_b.len() >= up.len() && got_a.len() >= down.len() && a.all_sent() && b.all_sent() {
+            assert_eq!(got_b, up);
+            assert_eq!(got_a, down);
+            return (a, b);
+        }
+        pump(&mut a, &mut b, clock, &mut rng);
+        clock += Duration::from_millis(20);
+    }
+    panic!("transfer did not finish");
+}
+
+#[test]
+fn v22_to_v22_uses_modulo_128_through_wraparound() {
+    let big = |call: &str| Station::new(call, Config { window: 16, ..cfg() });
+    // 40 000 bytes = 313 frames, so sequence numbers wrap past 127 twice, on a lossy link
+    let (a, b) = session(big("N0CALL"), big("N0BBS-3"), 40_000, 0.2, 5, false);
+    assert_eq!((a.version(), b.version()), ("2.2", "2.2"));
+}
+
+#[test]
+fn v22_caller_falls_back_when_the_bbs_refuses_sabme() {
+    let old = Station::new("N0BBS-3", Config { v22: false, ..cfg() });
+    let (mut a, b) = session(Station::new("N0CALL", cfg()), old, 3000, 0.0, 9, false);
+    assert_eq!((a.version(), b.version()), ("2.0", "2.0"));
+    assert!(a.take_events().iter().any(|e| e.contains("does not use AX.25 v2.2")));
+}
+
+#[test]
+fn v22_caller_falls_back_when_sabme_gets_no_answer() {
+    let (mut a, _) = session(Station::new("N0CALL", cfg()), Station::new("N0BBS-3", cfg()), 3000, 0.0, 2, true);
+    assert_eq!(a.version(), "2.0");
+    assert!(a.take_events().iter().any(|e| e.contains("no answer") && e.contains("trying v2.0")));
+}
+
+#[test]
+fn xid_limits_frames_to_what_the_other_side_can_take() {
+    let a = Station::new("N0CALL", Config { paclen: 256, window: 16, ..cfg() });
+    let b = Station::new("N0BBS-3", Config { paclen: 64, window: 3, ..cfg() });
+    let mut clock = Instant::now();
+    let (mut a, mut b) = (a, b);
+    b.listen = true;
+    a.connect("N0BBS-3", &[], None, clock);
+    // connect and let the XID exchange finish, without loss
+    for _ in 0..50 {
+        a.poll(clock);
+        b.poll(clock);
+        for raw in a.take_outbox() {
+            b.on_raw(&raw, clock);
+        }
+        for raw in b.take_outbox() {
+            a.on_raw(&raw, clock);
+        }
+        clock += Duration::from_millis(20);
+    }
+    assert_eq!(a.version(), "2.2");
+    a.send(&[b'x'; 1000]);
+    a.poll(clock);
+    let frames: Vec<Vec<u8>> = a.take_outbox();
+    let infos: Vec<usize> = frames.iter().filter_map(|r| term73::ax25::parse_for(r, true))
+        .filter(|f| f.pid.is_some()).map(|f| f.info.len()).collect();
+    assert_eq!(infos, vec![64, 64, 64], "at most 64 bytes a frame and 3 frames in flight, as B asked");
 }

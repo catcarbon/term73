@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use term73::ax25::{self, Config, Station};
+use term73::ax25::{Config, Station};
 use term73::kiss;
 use term73::link::Link;
 
@@ -118,9 +118,7 @@ pub fn air(radio: &Arc<Mutex<Radio>>, other: &mut Station) {
     let now = Instant::now();
     let sent: Vec<Vec<u8>> = std::mem::take(&mut radio.lock().unwrap().to_air);
     for raw in sent {
-        if let Some(f) = ax25::parse(&raw) {
-            other.on_frame(&f, now);
-        }
+        other.on_raw(&raw, now);
     }
     other.poll(now);
     for raw in other.take_outbox() {

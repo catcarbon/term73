@@ -14,7 +14,7 @@ term73 is a terminal program for packet radio that aims to quickly add support f
 
 - **Finds your rig.** Scans Bluetooth, serial devices, and local ports for radio and control interfaces.
 - **Learns the rig.** Probes the rig for capability and behavior, such as serial channel, power levels, frequency ranges, packet mode quirks.
-- **Connects.** Connected-mode AX.25 sessions to stations, nodes and BBSes, with digipeater paths.
+- **Connects.** Connected-mode AX.25 sessions to stations, nodes and BBSes, with digipeater paths. term73 tries AX.25 v2.2 first and falls back to v2.0 when the other station does not answer it; saved BBSes remember which version worked.
 - **Listens.** Shows packet traffic as it is heard and can save it to a file.
 - **Winlink.** Lets a Winlink client (for example Pat) send and receive mail through the radio's own TNC, picking the nearest gateway and tuning to it.
 - **Software modems.** A running modem73 can be used as the rig: term73 proxies application layer through modem73.
