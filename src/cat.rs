@@ -26,7 +26,7 @@ pub const COMMANDS: &[(&str, Risk, &str)] = &[
     ("BY", Risk::Read, "busy state (BY b)"),
     ("DL", Risk::Read, "dual/single band"),
     ("DW", Risk::Act, "step frequency down"),
-    ("ME", Risk::Read, "memory channel contents (ME nnn)"),
+    ("ME", Risk::Read, "memory channel contents (ME nnn; ME nnn,... writes or erases and is refused)"),
     ("MR", Risk::Read, "memory channel recall (MR b = read, MR b,nnn = set)"),
     ("PC", Risk::Read, "output power (PC b)"),
     ("RX", Risk::Act, "return to receive"),
@@ -84,6 +84,7 @@ pub enum Refused {
     ResetOrService(String),
     Transmits(String),
     PowerOff,
+    MemoryWrite,
 }
 
 impl std::fmt::Display for Refused {
@@ -92,6 +93,7 @@ impl std::fmt::Display for Refused {
             Refused::ResetOrService(n) => write!(f, "{n} is a reset or service command"),
             Refused::Transmits(n) => write!(f, "{n} can transmit; allow transmitting first"),
             Refused::PowerOff => write!(f, "PS with an argument can power the radio off"),
+            Refused::MemoryWrite => write!(f, "ME with more than a channel number writes or erases a memory channel"),
         }
     }
 }
@@ -108,6 +110,10 @@ pub fn check_allowed(line: &str, allow_tx: bool) -> Result<(), Refused> {
     }
     if name == "PS" && !line.eq_ignore_ascii_case("PS") {
         return Err(Refused::PowerOff);
+    }
+    // "ME nnn" reads a memory channel; "ME nnn," erases it and "ME nnn,<fields>" overwrites it (Hamlib thd74.c)
+    if name == "ME" && line.contains(',') {
+        return Err(Refused::MemoryWrite);
     }
     Ok(())
 }
@@ -185,6 +191,9 @@ mod tests {
         assert!(check_allowed("9Z", true).is_err());
         assert!(check_allowed("PS", false).is_ok());
         assert!(check_allowed("FQ 0", false).is_ok());
+        assert!(check_allowed("ME 005", false).is_ok());
+        assert_eq!(check_allowed("ME 005,", true), Err(Refused::MemoryWrite));
+        assert_eq!(check_allowed("me 005,0145030000,0", true), Err(Refused::MemoryWrite));
     }
 
     #[test]
