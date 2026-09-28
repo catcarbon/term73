@@ -67,6 +67,11 @@ impl Radio {
                 l.into()
             }
             l if l.starts_with("MR ") => format!("MR {:03}", self.mr[band(&l[3..])]),
+            l if l.starts_with("BC ") => {
+                let (c, p) = l[3..].split_once(',').unwrap();
+                self.bc = Some((c.parse().unwrap(), p.parse().unwrap()));
+                l.into()
+            }
             "BC" => {
                 let (c, p) = self.bc.unwrap_or((1, 1));
                 format!("BC {c},{p}")

@@ -578,6 +578,33 @@ fn tuning_leaves_memory_mode() {
     assert_eq!((r.vm[1], r.freq[1]), (0, 145_090_000));
 }
 
+/// With the user's yes, a session turns CTRL off (BC p,p) and back on afterwards.
+#[test]
+fn ctrl_is_off_for_a_session() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("ctrl");
+    let mut saved = std::collections::BTreeMap::new();
+    saved.insert("bbs3".to_string(), Bbs { call: "N0BBS-3".into(), mhz: 145.03, path: vec![], baud: 1200, ax25: None });
+    config::save_bbs(&saved).unwrap();
+    rig.radio.lock().unwrap().bc = Some((1, 0)); // CTRL on B (packet), PTT on A
+    let mut b = bbs("N0BBS-3");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    let asks = |rig: &Rig| rig.h().ask(Job::CtrlOnDataBand, Duration::from_secs(10)).unwrap();
+    assert_eq!(asks(&rig), None, "no question while transmit is off");
+    rig.h().send(Job::SetCallsign("n0call".into()));
+    rig.h().send(Job::SetTransmit(true));
+    assert_eq!(asks(&rig), Some(1));
+    rig.h().send(Job::MoveCtrl(true));
+    rig.h().send(Job::BbsConnect("bbs3".into()));
+    rig.wait_for("CTRL off for this session", Some(&mut b));
+    rig.wait_for("connected to N0BBS-3", Some(&mut b));
+    assert_eq!(rig.radio.lock().unwrap().bc, Some((0, 0)));
+    rig.h().send(Job::Disconnect);
+    rig.wait_for("CTRL back on band B", Some(&mut b));
+    assert_eq!(rig.radio.lock().unwrap().bc, Some((1, 0)));
+}
+
 /// A connect takes the data band off its memory channel, and packet mode ending puts it back.
 #[test]
 fn connect_puts_the_memory_channel_back() {
@@ -600,6 +627,7 @@ fn connect_puts_the_memory_channel_back() {
     assert_eq!(rig.radio.lock().unwrap().vm[1], 0, "VFO mode during the session");
     rig.h().send(Job::Disconnect);
     rig.wait_for("band B back on memory channel 054", Some(&mut b));
+    assert_eq!(rig.radio.lock().unwrap().bc, None, "CTRL untouched without the user's yes");
     let r = rig.radio.lock().unwrap();
     assert_eq!((r.vm[1], r.mr[1]), (1, 54));
 }

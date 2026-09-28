@@ -764,6 +764,20 @@ impl App {
         }
     }
 
+    /// Before a job that starts transmitting: if CTRL is on the data band, offer to move it for the session.
+    fn with_ctrl_check(&mut self, job: Job) {
+        self.wizard(move |c| {
+            if let Ok(Some(data)) = c.call(Job::CtrlOnDataBand) {
+                let q = format!("Band {} (packet) has CTRL. Turn CTRL off for this session and back on afterwards? (y/n)",
+                                engine::band_name(data));
+                let yes = c.ask(&q, Some("y"), false)?.trim().to_ascii_lowercase().starts_with('y');
+                let _ = c.jobs.send(Job::MoveCtrl(yes));
+            }
+            let _ = c.jobs.send(job);
+            Ok(())
+        });
+    }
+
     /// F8: show or hide the side panels.
     pub fn toggle_side(&mut self) {
         self.side_hidden = !self.side_hidden;
@@ -879,7 +893,7 @@ impl App {
                 } else {
                     Vec::new()
                 };
-                e.send(Job::Connect(call.to_string(), path));
+                self.with_ctrl_check(Job::Connect(call.to_string(), path));
             }
             "/disconnect" => e.send(Job::Disconnect),
             "/listen" => match sub.as_str() {
@@ -950,7 +964,7 @@ impl App {
                         self.push(&format!("  {name:12} {:10} {:8.3} MHz {} baud{via}{ver}", b.call, b.mhz, b.baud));
                     }
                 }
-                "connect" => e.send(Job::BbsConnect(arg(0)?.to_string())),
+                "connect" => self.with_ctrl_check(Job::BbsConnect(arg(0)?.to_string())),
                 "remove" => {
                     let mut all = config::load_bbs();
                     let name = arg(0)?;
@@ -963,7 +977,7 @@ impl App {
             "/winlink" => match sub.as_str() {
                 "setup" => self.wizard(winlink_setup_flow),
                 "gateways" => e.send(Job::Gateways(15)),
-                "start" => e.send(Job::WinlinkStart(8772)),
+                "start" => self.with_ctrl_check(Job::WinlinkStart(8772)),
                 "stop" => e.send(Job::WinlinkStop),
                 _ => self.push(HELP[2].1),
             },
