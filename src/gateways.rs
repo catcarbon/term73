@@ -137,20 +137,44 @@ pub fn radio_model(link: &mut dyn Link) -> Option<String> {
     r.strip_prefix("ID ").map(|m| m.trim().to_string())
 }
 
+/// Where a band was before `ensure_vfo` switched it: its VM mode and its memory channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemorySpot {
+    pub band: u8,
+    pub mode: String,
+    pub channel: Option<String>,
+}
+
 /// Put `band` in VFO mode (VM b,0) so a frequency change does not land on a memory channel.
-/// Returns true when it had to switch. A radio without VM is left alone.
-pub fn ensure_vfo(link: &mut dyn Link, band: u8) -> Result<bool, String> {
+/// Returns where the band was when it had to switch. A radio without VM is left alone.
+pub fn ensure_vfo(link: &mut dyn Link, band: u8) -> Result<Option<MemorySpot>, String> {
     let vm = reply(link, &format!("VM {band}"));
-    let Some(mode) = vm.strip_prefix(&format!("VM {band},")) else { return Ok(false) };
+    let Some(mode) = vm.strip_prefix(&format!("VM {band},")).map(str::to_string) else { return Ok(None) };
     if mode == "0" {
-        return Ok(false);
+        return Ok(None);
     }
+    let channel = reply(link, &format!("MR {band}")).strip_prefix("MR ").map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty() && c.chars().all(|x| x.is_ascii_digit()));
     cat::cat(link, &format!("VM {band},0"), T, false).map_err(|e| e.to_string())?;
     let back = reply(link, &format!("VM {band}"));
     if back != format!("VM {band},0") {
         return Err(format!("could not switch band {band} to VFO mode (it answered {back:?})"));
     }
-    Ok(true)
+    Ok(Some(MemorySpot { band, mode, channel }))
+}
+
+/// Put a band back where `ensure_vfo` found it: its VM mode, then its memory channel.
+pub fn restore_memory(link: &mut dyn Link, spot: &MemorySpot) -> Result<(), String> {
+    let b = spot.band;
+    cat::cat(link, &format!("VM {b},{}", spot.mode), T, false).map_err(|e| e.to_string())?;
+    if reply(link, &format!("VM {b}")) != format!("VM {b},{}", spot.mode) {
+        return Err(format!("could not put band {b} back in memory mode"));
+    }
+    if let Some(ch) = &spot.channel
+        && reply(link, &format!("MR {b}")).strip_prefix("MR ").map(str::trim) != Some(ch.as_str()) {
+            cat::cat(link, &format!("MR {b},{ch}"), T, false).map_err(|e| e.to_string())?;
+        }
+    Ok(())
 }
 
 /// Set `band` to `mhz`, read it back, and require FM with no repeater shift.

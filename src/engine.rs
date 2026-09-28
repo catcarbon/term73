@@ -284,6 +284,8 @@ struct Engine {
     last_rx: Option<Instant>,
     /// Packet mode should end once the TNC has sent what it holds.
     leave_kiss_pending: bool,
+    /// A band a connect took off a memory channel, put back when packet mode ends.
+    memory_restore: Option<gateways::MemorySpot>,
     running: bool,
 }
 
@@ -328,7 +330,7 @@ impl Engine {
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
             monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, bands: None, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
-            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, running: true,
+            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, memory_restore: None, running: true,
         };
         e.publish();
         e
@@ -456,7 +458,10 @@ impl Engine {
                     self.say(format!("{c} -> {}", if r.is_empty() { "(no reply)" } else { &r }));
                 }
             }
-            Job::Tune(mhz) => self.tune(mhz)?,
+            Job::Tune(mhz) => {
+                self.tune(mhz)?;
+                self.memory_restore = None; // an explicit tune stays in VFO mode
+            }
             Job::Power(level) => self.power(level)?,
             Job::KissOn => self.enter_kiss()?,
             Job::KissOff => {
@@ -697,6 +702,7 @@ impl Engine {
         }
         self.leave_kiss();
         self.leave_kiss_pending = false;
+        self.put_memory_back();
         self.radio = None;
         self.modem = None;
         self.ctl = None;
@@ -729,8 +735,11 @@ impl Engine {
         let shift = self.prof.shift_field.or_else(|| gateways::default_shift_field(self.model.as_deref().unwrap_or("")));
         let band = self.band;
         match gateways::ensure_vfo(self.radio.as_deref_mut().ok_or("no radio")?, band) {
-            Ok(true) => self.say(format!("band {} was on a memory channel; switched it to VFO mode to tune", band_name(band))),
-            Ok(false) => {}
+            Ok(Some(spot)) => {
+                self.say(format!("band {} was on a memory channel; switched it to VFO mode to tune", band_name(band)));
+                self.memory_restore.get_or_insert(spot);
+            }
+            Ok(None) => {}
             Err(e) => {
                 if was {
                     self.enter_kiss()?;
@@ -803,6 +812,18 @@ impl Engine {
         self.leave_kiss_pending = false;
         self.leave_kiss();
         self.say("radio back to normal operation");
+        self.put_memory_back();
+    }
+
+    /// Return a band that a connect took off a memory channel.
+    fn put_memory_back(&mut self) {
+        let Some(spot) = self.memory_restore.take() else { return };
+        let Some(r) = self.radio.as_deref_mut() else { return };
+        match gateways::restore_memory(r, &spot) {
+            Ok(()) => self.say(format!("band {} back on memory channel {}", band_name(spot.band),
+                                       spot.channel.as_deref().unwrap_or("?"))),
+            Err(e) => self.say(format!("warning: {e}")),
+        }
     }
 
     /// True once the TNC has had time to send our last frame: leaving packet mode earlier strands it in
@@ -1212,6 +1233,7 @@ impl Engine {
                     self.say(format!("rigctl: {:.3} MHz is outside this rig's bands", hz as f64 / 1e6));
                     return Err(EINVAL);
                 }
+                self.memory_restore = None;
                 self.tune(hz as f64 / 1e6).map(|_| Resp::Done).map_err(|e| {
                     self.say(format!("rigctl: {e}"));
                     EINVAL

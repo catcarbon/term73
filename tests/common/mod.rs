@@ -25,6 +25,8 @@ pub struct Radio {
     pub tx_band: Option<u8>,
     /// VM per band: 0 VFO, 1 memory.
     pub vm: [u8; 2],
+    /// MR per band: memory channel number.
+    pub mr: [u16; 2],
     pub keyed: bool,
     pub cat_log: Vec<String>,
     pub to_host: Vec<u8>,       // bytes the radio sends to term73
@@ -59,6 +61,12 @@ impl Radio {
                 l.into()
             }
             l if l.starts_with("VM ") => format!("VM {},{}", band(&l[3..]), self.vm[band(&l[3..])]),
+            l if l.starts_with("MR ") && l.contains(',') => {
+                let (b, c) = l[3..].split_once(',').unwrap();
+                self.mr[band(b)] = c.parse().unwrap();
+                l.into()
+            }
+            l if l.starts_with("MR ") => format!("MR {:03}", self.mr[band(&l[3..])]),
             "BC" => {
                 let (c, p) = self.bc.unwrap_or((1, 1));
                 format!("BC {c},{p}")
