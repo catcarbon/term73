@@ -520,7 +520,7 @@ fn raw_tx_is_unkeyed_by_the_time_limit() {
     assert!(!rig.radio.lock().unwrap().keyed);
     rig.h().send(Job::SetTransmit(true));
     rig.h().send(Job::Cat("TX".into()));
-    rig.wait_for("TX -> TX 0", None);
+    rig.wait_for("TX -> TX 1", None);
     assert!(rig.radio.lock().unwrap().keyed);
     rig.wait_for("unkeying", None);
     let end = Instant::now() + Duration::from_secs(5);
@@ -528,4 +528,37 @@ fn raw_tx_is_unkeyed_by_the_time_limit() {
         assert!(Instant::now() < end, "the time limit did not send RX");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Rig-control PTT keys only when the radio's PTT band is the data band (BC ctrl,ptt).
+#[test]
+fn rig_ptt_needs_ptt_on_the_data_band() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let rig = Rig::new("pttband");
+    config::save_radio("COM10", &RadioProfile { data_band: Some(1), ptt_verified: Some(true), ..Default::default() }).unwrap();
+    let mut rig = rig;
+    rig.radio.lock().unwrap().bc = Some((1, 0)); // CTRL on B, PTT on A
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.h().send(Job::SetTransmit(true));
+    rig.wait_for("TM-D750, data band B", None);
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Ptt(true, tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(false));
+    rig.wait_for("PTT is on band A but packet uses band B", None);
+    assert!(!rig.radio.lock().unwrap().keyed);
+    rig.radio.lock().unwrap().bc = Some((1, 1));
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Ptt(true, tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(true));
+    assert!(rig.radio.lock().unwrap().keyed);
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Ptt(false, tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(true));
+    // BC says B, but the TX reply names band A: unkey at once
+    rig.radio.lock().unwrap().tx_band = Some(0);
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Ptt(true, tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(false));
+    rig.wait_for("keyed band A instead of data band B; unkeyed", None);
+    assert!(!rig.radio.lock().unwrap().keyed);
 }

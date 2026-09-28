@@ -1136,6 +1136,8 @@ impl App {
             Self::row(t, "profile", if s.profile_saved { "saved".into() } else { "none".into() }, if s.profile_saved { t.value } else { t.warnv }),
             Self::row(t, "frequency", s.freq_mhz.map(|f| format!("{f:.3} MHz")).unwrap_or("?".into()), t.value),
             Self::row(t, "TNC", tnc.into(), if s.packet == Packet::Idle { t.value } else { t.good }),
+            Self::row(t, "PTT/CTRL", s.bands.map(|(c, p)| format!("{} / {}", engine::band_name(p), engine::band_name(c)))
+                .unwrap_or_else(|| "?".into()), t.value),
             Self::row(t, "transmit", if s.transmit_allowed { "ALLOWED".into() } else { "off".into() }, if s.transmit_allowed { t.tx } else { t.value }),
         ]
     }

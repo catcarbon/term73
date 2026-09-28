@@ -91,6 +91,8 @@ pub struct Snapshot {
     pub winlink_ready: bool,
     pub transmitting: bool,
     pub software_modem: bool,
+    /// (CTRL band, PTT band) from BC: 0 = A, 1 = B.
+    pub bands: Option<(u8, u8)>,
     pub heard: Vec<HeardEntry>,
     /// The connected (or connecting) station, for the Session panel.
     pub session: Option<SessionInfo>,
@@ -259,6 +261,8 @@ struct Engine {
     decoder: kiss::Decoder,
     station: Option<Station>,
     rx_cr: bool,
+    /// (CTRL band, PTT band) as last read with BC.
+    bands: Option<(u8, u8)>,
     watch: Option<Watch>,
     /// AX.25 version each station used this session (saved BBSes also keep it in their profile).
     ax25_seen: BTreeMap<String, &'static str>,
@@ -283,6 +287,21 @@ struct Engine {
 /// 144.390 North America, 144.800 Europe and Africa, 145.175 Australia, 145.825 the ISS digipeater.
 const APRS_MHZ: &[f64] = &[144.390, 144.800, 145.175, 145.825];
 
+/// Read BC: the TM-D750 answers "BC ctrl,ptt"; radios with one value use it for both. 0 = A, 1 = B.
+fn read_bands(link: &mut dyn Link) -> Option<(u8, u8)> {
+    let r = cat::cat(link, "BC", Duration::from_secs(2), false).ok()?;
+    let v: Vec<u8> = r.strip_prefix("BC ")?.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+    match v.as_slice() {
+        [both] => Some((*both, *both)),
+        [ctrl, ptt] => Some((*ctrl, *ptt)),
+        _ => None,
+    }
+}
+
+pub fn band_name(b: u8) -> &'static str {
+    if b == 0 { "A" } else { "B" }
+}
+
 fn now_utc_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -298,7 +317,7 @@ impl Engine {
         let e = Engine {
             out, snap, opener, self_jobs, cfg, target: None, radio: None, modem: None, ctl: None, model: None,
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
-            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
+            monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, bands: None, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
             ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, running: true,
         };
@@ -330,6 +349,7 @@ impl Engine {
         s.winlink_ready = self.bridge_listener.is_some();
         s.transmitting = self.keyed_at.is_some() || self.last_tx.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
         s.software_modem = self.modem.is_some();
+        s.bands = self.bands;
         let mut heard: Vec<HeardEntry> = self.heard.values().cloned().collect();
         heard.sort_by_key(|h| std::cmp::Reverse(h.last_utc_secs));
         heard.truncate(30);
@@ -579,13 +599,25 @@ impl Engine {
         Ok(())
     }
 
-    fn need_tx(&self) -> Result<(), String> {
+    fn need_tx(&mut self) -> Result<(), String> {
         if !self.tx_allowed {
             return Err("this transmits: /transmit on first".into());
         }
         if self.cfg.callsign.is_none() {
             return Err("no callsign: /config callsign <CALL>".into());
         }
+        // Whether the TNC transmits on the data band or on the PTT band is not verified, so both must match.
+        // In packet mode rig control is unavailable and the last reading stands.
+        if self.modem.is_none() && !self.kiss
+            && let Some(r) = self.radio.as_deref_mut() {
+                self.bands = read_bands(r);
+            }
+        if self.modem.is_none()
+            && let Some((_, ptt)) = self.bands
+            && ptt != self.band {
+                return Err(format!("PTT is on band {} but packet uses band {}: move PTT to band {} first",
+                                   band_name(ptt), band_name(self.band), band_name(self.band)));
+            }
         Ok(())
     }
 
@@ -636,6 +668,7 @@ impl Engine {
         self.model = gateways::radio_model(r);
         let tn = cat::cat(r, "TN", Duration::from_secs(2), false).unwrap_or_default();
         self.band = self.prof.data_band.unwrap_or_else(|| tn.split(',').nth(1).and_then(|b| b.parse().ok()).unwrap_or(1));
+        self.bands = read_bands(r);
         let fq = cat::cat(r, &format!("FQ {}", self.band), Duration::from_secs(2), false).unwrap_or_default();
         self.freq = fq.split(',').nth(1).and_then(|f| f.parse::<f64>().ok()).map(|hz| hz / 1e6);
         self.say(format!("{}, data band {}{}", self.model.as_deref().unwrap_or("unknown radio"),
@@ -1268,12 +1301,34 @@ impl Engine {
             self.say("rigctl: keying refused: this radio's TX command is not confirmed to key the data band (radio profile)");
             return Ok(false);
         }
+        // TX keys the PTT band, which the front panel can move at any time: check it now
+        self.bands = read_bands(self.radio.as_deref_mut().unwrap());
+        match self.bands {
+            Some((_, ptt)) if ptt == self.band => {}
+            Some((_, ptt)) => {
+                self.say(format!("rigctl: keying refused: PTT is on band {} but packet uses band {}",
+                                 band_name(ptt), band_name(self.band)));
+                return Ok(false);
+            }
+            None => {
+                self.say("rigctl: keying refused: cannot read which band PTT is on (BC)");
+                return Ok(false);
+            }
+        }
         let r = cat::cat(self.radio.as_deref_mut().unwrap(), "TX", Duration::from_secs(2), true).unwrap_or_default();
         if !r.starts_with("TX") {
             self.say(format!("rigctl: keying failed ({r:?})"));
             return Ok(false);
         }
         self.keyed_at = Some(Instant::now());
+        // "TX b" names the band that keyed; anything but the data band is unkeyed at once
+        let keyed = r.strip_prefix("TX ").and_then(|b| b.trim().parse::<u8>().ok());
+        if keyed != Some(self.band) {
+            let _ = self.ptt(false);
+            self.say(format!("rigctl: the radio keyed band {} instead of data band {}; unkeyed",
+                             keyed.map(band_name).unwrap_or("?"), band_name(self.band)));
+            return Ok(false);
+        }
         Ok(true)
     }
 

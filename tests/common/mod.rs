@@ -19,6 +19,10 @@ pub struct Radio {
     /// MD codes per band: 0 FM, 2 AM.
     pub mode: [u8; 2],
     pub squelch: [u8; 2],
+    /// BC reply: (CTRL band, PTT band); None answers "BC 1,1" (both on the data band).
+    pub bc: Option<(u8, u8)>,
+    /// Band TX reports as keyed; None follows the PTT band.
+    pub tx_band: Option<u8>,
     pub keyed: bool,
     pub cat_log: Vec<String>,
     pub to_host: Vec<u8>,       // bytes the radio sends to term73
@@ -35,7 +39,10 @@ impl Radio {
             "ID" => "ID TM-D750".into(),
             "FV" => "FV 1.02".into(),
             "TN" => "TN 0,1".into(),
-            "TX" => { self.keyed = true; "TX 0".into() }
+            "TX" => {
+                self.keyed = true;
+                format!("TX {}", self.tx_band.unwrap_or(self.bc.unwrap_or((1, 1)).1))
+            }
             "RX" => { self.keyed = false; "RX 0".into() }
             l if l.starts_with("TN 2,") => { self.kiss = true; l.into() }
             l if l.starts_with("FQ ") && l.contains(',') => {
@@ -44,6 +51,10 @@ impl Radio {
                 l.into()
             }
             l if l.starts_with("FQ ") => format!("FQ {},{:010}", band(&l[3..]), self.freq[band(&l[3..])]),
+            "BC" => {
+                let (c, p) = self.bc.unwrap_or((1, 1));
+                format!("BC {c},{p}")
+            }
             l if l.starts_with("SQ ") && l.contains(',') => {
                 let (b, v) = l[3..].split_once(',').unwrap();
                 self.squelch[band(b)] = v.parse().unwrap();
