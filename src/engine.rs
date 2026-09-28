@@ -1188,6 +1188,21 @@ impl Engine {
                     _ => Err(ENAVAIL),
                 }
             }
+            Req::GetSquelch if cat_ok => {
+                let band = self.band;
+                let r = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("SQ {band}"), Duration::from_secs(2), false)
+                    .unwrap_or_default();
+                r.strip_prefix(&format!("SQ {band},")).and_then(|v| v.parse::<u8>().ok())
+                    .map(|n| Resp::Level(n.min(rigctld::SQUELCH_MAX) as f32 / rigctld::SQUELCH_MAX as f32)).ok_or(ENAVAIL)
+            }
+            Req::SetSquelch(f) if cat_ok => {
+                let band = self.band;
+                let n = (f * rigctld::SQUELCH_MAX as f32).round() as u8;
+                let r = self.radio.as_deref_mut().unwrap();
+                let _ = cat::cat(r, &format!("SQ {band},{n}"), Duration::from_secs(2), false);
+                let back = cat::cat(r, &format!("SQ {band}"), Duration::from_secs(2), false).unwrap_or_default();
+                if back == format!("SQ {band},{n}") { Ok(Resp::Done) } else { Err(EINVAL) }
+            }
             Req::GetPower if cat_ok => gateways::get_power(self.radio.as_deref_mut().unwrap(), self.band)
                 .map(|l| Resp::Level(rigctld::level_to_fraction(l))).map_err(|_| ENAVAIL),
             Req::SetPower(f) if self.modem.is_none() => {

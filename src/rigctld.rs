@@ -22,6 +22,7 @@ const MODE_AM: u64 = 1 << 0;
 const MODE_FM: u64 = 1 << 5;
 const MODE_DSTAR: u64 = 1 << 24;
 const LEVEL_RFPOWER: u64 = 1 << 12;
+const LEVEL_SQL: u64 = 1 << 5;
 const VFO_A: u32 = 1 << 0;
 const VFO_B: u32 = 1 << 1;
 const PTT_NONE: u32 = 0;
@@ -39,6 +40,9 @@ pub enum Req {
     GetDcd,
     GetPower,
     SetPower(f32),
+    /// Squelch as a fraction, 0.0 open to 1.0 tightest.
+    GetSquelch,
+    SetSquelch(f32),
     GetVfo,
     /// Repeater shift direction and offset (read only).
     GetShift,
@@ -148,6 +152,9 @@ pub fn kenwood_shift(code: u8) -> Option<&'static str> {
     }
 }
 
+/// Kenwood `SQ` squelch steps on the TM-D750: 0 open to 31 tightest.
+pub const SQUELCH_MAX: u8 = 31;
+
 /// Power levels are reported as fractions of full power: high 1.0, mid 0.5, low 0.2 (coarse; the radio has three steps).
 pub fn level_to_fraction(level: u8) -> f32 {
     match level {
@@ -242,6 +249,20 @@ pub fn answer(line: &str, handler: &Handler, caps: &CapsFn, keyed: &mut bool) ->
             Ok(_) => rprt(ENIMPL),
             Err(e) => rprt(e),
         },
+        "l" | "\\get_level" if arg(1).is_some_and(|l| l.eq_ignore_ascii_case("SQL")) => match handler(Req::GetSquelch) {
+            Ok(Resp::Level(f)) => format!("{f:.6}\n"),
+            Ok(_) => rprt(ENIMPL),
+            Err(e) => rprt(e),
+        },
+        "L" | "\\set_level" if arg(1).is_some_and(|l| l.eq_ignore_ascii_case("SQL")) => {
+            match arg(2).and_then(|v| v.parse::<f32>().ok()).filter(|v| (0.0..=1.0).contains(v)) {
+                Some(v) => match handler(Req::SetSquelch(v)) {
+                    Ok(_) => rprt(0),
+                    Err(e) => rprt(e),
+                },
+                None => rprt(EINVAL),
+            }
+        }
         "l" | "\\get_level" => match arg(1) {
             Some(l) if l.eq_ignore_ascii_case("RFPOWER") => match handler(Req::GetPower) {
                 Ok(Resp::Level(f)) => format!("{f:.6}\n"),
@@ -285,7 +306,7 @@ pub fn dump_state(c: &Caps) -> String {
     s.push_str("0 0\n");
     s.push_str(&format!("0x{MODE_FM:x} 15000\n0x{MODE_AM:x} 10000\n0 0\n"));
     s.push_str("0\n0\n0\n0\n\n\n"); // max RIT, XIT, IF shift, announces; no preamp; no attenuator
-    let levels = if c.power { LEVEL_RFPOWER } else { 0 };
+    let levels = if c.power { LEVEL_RFPOWER | LEVEL_SQL } else { 0 };
     s.push_str(&format!("0x0\n0x0\n0x{levels:x}\n0x{levels:x}\n0x0\n0x0\n"));
     s.push_str(&format!("vfo_ops=0x0\nptt_type=0x{:x}\ntargetable_vfo=0x0\n", if c.ptt { PTT_RIG } else { PTT_NONE }));
     s.push_str("has_set_vfo=0\nhas_get_vfo=1\nhas_set_freq=1\nhas_get_freq=1\nhas_set_conf=0\nhas_get_conf=0\n");
@@ -335,7 +356,7 @@ mod tests {
         assert_eq!(lines[3], "118000000 174000000 0x1000021 -1 -1 0x3 0x0");
         assert_eq!(lines[4], "0 0 0 0 0 0 0");
         assert_eq!(lines[5], "144000000 148000000 0x20 1000 50000 0x3 0x0");
-        assert!(d.contains("\n0 0\n0x20 15000\n0x1 10000\n0 0\n0\n0\n0\n0\n\n\n0x0\n0x0\n0x1000\n0x1000\n0x0\n0x0\nvfo_ops=0x0\nptt_type=0x0\n"), "{d}");
+        assert!(d.contains("\n0 0\n0x20 15000\n0x1 10000\n0 0\n0\n0\n0\n0\n\n\n0x0\n0x0\n0x1020\n0x1020\n0x0\n0x0\nvfo_ops=0x0\nptt_type=0x0\n"), "{d}");
         assert!(d.ends_with("done\n"));
     }
 
@@ -375,7 +396,8 @@ mod tests {
         assert_eq!((kenwood_mode_code("AM"), kenwood_mode_code("D-STAR")), (Some(2), None));
         assert_eq!(ask("v"), "VFOA\n");
         assert_eq!(ask("l RFPOWER"), "0.500000\n");
-        assert_eq!(ask("l SQL"), "RPRT -11\n");
+        assert_eq!(ask("l SQL"), "RPRT -11\n", "the test handler has no squelch");
+        assert_eq!(ask("L SQL 1.5"), "RPRT -1\n");
         assert_eq!(ask("T 1"), "RPRT -9\n");
         assert_eq!(ask("t"), "0\n");
         assert_eq!(ask("\\chk_vfo"), "0\n");

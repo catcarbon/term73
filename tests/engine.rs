@@ -434,6 +434,11 @@ fn rigctl_server_drives_the_engine() {
     assert_eq!(ask("r", 1), "None\n", "FO field 11 is 0 on the simulated radio");
     assert_eq!(ask("o", 1), "600000\n", "FO field 2 is the offset in Hz");
     assert_eq!(ask(r"\get_lock_mode", 2), "0\nRPRT 0\n");
+    assert_eq!(ask("L SQL 1.0", 1), "RPRT 0\n");
+    assert_eq!(rig.radio.lock().unwrap().squelch[1], 31, "full squelch is step 31");
+    assert_eq!(ask("l SQL", 1), "1.000000\n");
+    assert_eq!(ask("L SQL 0", 1), "RPRT 0\n");
+    assert_eq!(ask("l SQL", 1), "0.000000\n");
     assert!(ask(r"\dump_state", 1).starts_with('1'));
     assert_eq!(rig.radio.lock().unwrap().freq[1], 146_520_000);
     assert!(!rig.radio.lock().unwrap().keyed);
