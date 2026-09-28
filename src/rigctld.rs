@@ -23,6 +23,9 @@ const MODE_FM: u64 = 1 << 5;
 const MODE_DSTAR: u64 = 1 << 24;
 const LEVEL_RFPOWER: u64 = 1 << 12;
 const LEVEL_SQL: u64 = 1 << 5;
+const FUNC_TONE: u64 = 1 << 4;
+const FUNC_TSQL: u64 = 1 << 5;
+const FUNC_CSQL: u64 = 1 << 33;
 const VFO_A: u32 = 1 << 0;
 const VFO_B: u32 = 1 << 1;
 const PTT_NONE: u32 = 0;
@@ -47,6 +50,8 @@ pub enum Req {
     /// Repeater shift direction and offset (read only).
     GetShift,
     GetOffset,
+    /// Tone settings of the data band (read only).
+    GetTones,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +65,19 @@ pub enum Resp {
     Band(u8),
     /// Hamlib repeater shift: "None", "+" or "-".
     Shift(&'static str),
+    Tones(Tones),
+}
+
+/// Tone settings as Hamlib reports them: tones in tenths of Hz, DCS as the code number.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Tones {
+    pub tone_on: bool,
+    pub ctcss_on: bool,
+    pub dcs_on: bool,
+    pub cross_on: bool,
+    pub tone: u32,
+    pub ctcss: u32,
+    pub dcs: u32,
 }
 
 /// What the rig can do, reported to clients in `\dump_state`.
@@ -152,6 +170,22 @@ pub fn kenwood_shift(code: u8) -> Option<&'static str> {
     }
 }
 
+/// The 42 CTCSS tones Kenwood radios index, in tenths of Hz (index 8 = 88.5 Hz, 18 = 123.0 Hz).
+pub const KENWOOD_TONES: [u32; 42] = [
+    670, 693, 719, 744, 770, 797, 825, 854, 885, 915, 948, 974, 1000, 1035, 1072, 1109, 1148, 1188, 1230, 1273, 1318,
+    1365, 1413, 1462, 1514, 1567, 1622, 1679, 1738, 1799, 1862, 1928, 2035, 2065, 2107, 2181, 2257, 2291, 2336, 2418,
+    2503, 2541,
+];
+
+/// The 104 standard DCS codes Kenwood radios index (index 103 = 754).
+pub const DCS_CODES: [u32; 104] = [
+    23, 25, 26, 31, 32, 36, 43, 47, 51, 53, 54, 65, 71, 72, 73, 74, 114, 115, 116, 122, 125, 131, 132, 134, 143, 145,
+    152, 155, 156, 162, 165, 172, 174, 205, 212, 223, 225, 226, 243, 244, 245, 246, 251, 252, 255, 261, 263, 265, 266,
+    271, 274, 306, 311, 315, 325, 331, 332, 343, 346, 351, 356, 364, 365, 371, 411, 412, 413, 423, 431, 432, 445, 446,
+    452, 454, 455, 462, 464, 465, 466, 503, 506, 516, 523, 526, 532, 546, 565, 606, 612, 624, 627, 631, 632, 654, 662,
+    664, 703, 712, 723, 731, 732, 734, 743, 754,
+];
+
 /// Kenwood `SQ` squelch steps on the TM-D750: 0 open to 31 tightest.
 pub const SQUELCH_MAX: u8 = 31;
 
@@ -220,6 +254,27 @@ pub fn answer(line: &str, handler: &Handler, caps: &CapsFn, keyed: &mut bool) ->
             Ok(Resp::Shift(s)) => format!("{s}\n"),
             Ok(_) => rprt(ENIMPL),
             Err(e) => rprt(e),
+        },
+        "c" | "\\get_ctcss_tone" | "\\get_ctcss_sql" | "d" | "\\get_dcs_code" | "\\get_dcs_sql" => match handler(Req::GetTones) {
+            Ok(Resp::Tones(t)) => format!("{}\n", match cmd {
+                "c" | "\\get_ctcss_tone" => t.tone,
+                "\\get_ctcss_sql" => t.ctcss,
+                _ => t.dcs,
+            }),
+            Ok(_) => rprt(ENIMPL),
+            Err(e) => rprt(e),
+        },
+        "u" | "\\get_func" => match (arg(1).map(|f| f.to_ascii_uppercase()), handler(Req::GetTones)) {
+            (Some(f), Ok(Resp::Tones(t))) if ["TONE", "TSQL", "CSQL"].contains(&f.as_str()) => {
+                let on = match f.as_str() {
+                    "TONE" => t.tone_on,
+                    "TSQL" => t.ctcss_on,
+                    _ => t.dcs_on,
+                };
+                format!("{}\n", u8::from(on))
+            }
+            (Some(_), _) => rprt(ENAVAIL),
+            (None, _) => rprt(EINVAL),
         },
         "o" | "\\get_rptr_offs" => match handler(Req::GetOffset) {
             Ok(Resp::Freq(hz)) => format!("{hz}\n"),
@@ -307,10 +362,14 @@ pub fn dump_state(c: &Caps) -> String {
     s.push_str(&format!("0x{MODE_FM:x} 15000\n0x{MODE_AM:x} 10000\n0 0\n"));
     s.push_str("0\n0\n0\n0\n\n\n"); // max RIT, XIT, IF shift, announces; no preamp; no attenuator
     let levels = if c.power { LEVEL_RFPOWER | LEVEL_SQL } else { 0 };
-    s.push_str(&format!("0x0\n0x0\n0x{levels:x}\n0x{levels:x}\n0x0\n0x0\n"));
+    let funcs = if c.power { FUNC_TONE | FUNC_TSQL | FUNC_CSQL } else { 0 };
+    s.push_str(&format!("0x{funcs:x}\n0x0\n0x{levels:x}\n0x{levels:x}\n0x0\n0x0\n"));
     s.push_str(&format!("vfo_ops=0x0\nptt_type=0x{:x}\ntargetable_vfo=0x0\n", if c.ptt { PTT_RIG } else { PTT_NONE }));
     s.push_str("has_set_vfo=0\nhas_get_vfo=1\nhas_set_freq=1\nhas_get_freq=1\nhas_set_conf=0\nhas_get_conf=0\n");
     s.push_str("has_power2mW=0\nhas_mW2power=0\nhas_get_ant=0\nhas_set_ant=0\ntimeout=2000\nrig_model=2\n");
+    let ctcss: Vec<String> = KENWOOD_TONES.iter().map(|t| format!(" {}.{}", t / 10, t % 10)).collect();
+    let dcs: Vec<String> = DCS_CODES.iter().map(|c| format!(" {c}")).collect();
+    s.push_str(&format!("ctcss_list={}\ndcs_list={}\n", ctcss.concat(), dcs.concat()));
     s.push_str(&format!("rigctld_version=term73 {}\ndone\n", env!("CARGO_PKG_VERSION")));
     s
 }
@@ -356,7 +415,8 @@ mod tests {
         assert_eq!(lines[3], "118000000 174000000 0x1000021 -1 -1 0x3 0x0");
         assert_eq!(lines[4], "0 0 0 0 0 0 0");
         assert_eq!(lines[5], "144000000 148000000 0x20 1000 50000 0x3 0x0");
-        assert!(d.contains("\n0 0\n0x20 15000\n0x1 10000\n0 0\n0\n0\n0\n0\n\n\n0x0\n0x0\n0x1020\n0x1020\n0x0\n0x0\nvfo_ops=0x0\nptt_type=0x0\n"), "{d}");
+        assert!(d.contains("\n0 0\n0x20 15000\n0x1 10000\n0 0\n0\n0\n0\n0\n\n\n0x200000030\n0x0\n0x1020\n0x1020\n0x0\n0x0\nvfo_ops=0x0\nptt_type=0x0\n"), "{d}");
+        assert!(d.contains("\nctcss_list= 67.0 69.3 ") && d.contains(" 254.1\ndcs_list= 23 25 ") && d.contains(" 754\nrigctld_version="), "{d}");
         assert!(d.ends_with("done\n"));
     }
 
@@ -393,6 +453,7 @@ mod tests {
         assert_eq!(kenwood_mode(2), Some(("AM", 10000)));
         assert_eq!(kenwood_mode(4).map(|m| m.0), Some("D-STAR"));
         assert_eq!(kenwood_mode(3), None);
+        assert_eq!((KENWOOD_TONES[8], KENWOOD_TONES[18], DCS_CODES[0], DCS_CODES[103]), (885, 1230, 23, 754));
         assert_eq!((kenwood_mode_code("AM"), kenwood_mode_code("D-STAR")), (Some(2), None));
         assert_eq!(ask("v"), "VFOA\n");
         assert_eq!(ask("l RFPOWER"), "0.500000\n");

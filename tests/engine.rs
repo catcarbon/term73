@@ -433,6 +433,12 @@ fn rigctl_server_drives_the_engine() {
     assert_eq!(ask("M FM 15000", 1), "RPRT 0\n");
     assert_eq!(ask("r", 1), "None\n", "FO field 11 is 0 on the simulated radio");
     assert_eq!(ask("o", 1), "600000\n", "FO field 2 is the offset in Hz");
+    assert_eq!(ask("c", 1), "885\n", "FO field 12 index 8 is 88.5 Hz");
+    assert_eq!(ask(r"\get_ctcss_sql", 1), "885\n");
+    assert_eq!(ask("d", 1), "23\n", "FO field 14 index 0 is DCS 023");
+    assert_eq!(ask("u TONE", 1), "0\n");
+    assert_eq!(ask("u TSQL", 1), "0\n");
+    assert_eq!(ask("u NB", 1), "RPRT -11\n");
     assert_eq!(ask(r"\get_lock_mode", 2), "0\nRPRT 0\n");
     assert_eq!(ask("L SQL 1.0", 1), "RPRT 0\n");
     assert_eq!(rig.radio.lock().unwrap().squelch[1], 31, "full squelch is step 31");

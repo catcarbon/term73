@@ -1171,6 +1171,29 @@ impl Engine {
             }
             Req::GetMode => Ok(Resp::Mode("FM", 15000)), // term73 only enters packet mode after tuning FM
             Req::GetVfo => Ok(Resp::Band(self.band)),
+            Req::GetTones if cat_ok => {
+                // FO layout: 6 tone, 7 CTCSS, 8 DCS, 9 cross-tone, 12 tone index, 13 CTCSS index, 14 DCS index on the
+                // TM-D750; the TH-D75 has two more fields before them, which its later shift field shows
+                let band = self.band;
+                let base = self.prof.shift_field.or_else(|| gateways::default_shift_field(self.model.as_deref().unwrap_or("")))
+                    .and_then(|s| s.checked_sub(11)).ok_or(ENAVAIL)?;
+                let fo = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("FO {band}"), Duration::from_secs(2), false)
+                    .unwrap_or_default();
+                let f: Vec<usize> = fo.strip_prefix("FO ").unwrap_or("").split(',').map(|v| v.parse().unwrap_or(usize::MAX)).collect();
+                let get = |i: usize| f.get(base + i).copied().filter(|&v| v != usize::MAX);
+                let flag = |i: usize| get(i).map(|v| v == 1);
+                let tone = |i: usize| get(i).and_then(|k| rigctld::KENWOOD_TONES.get(k).copied());
+                let tones = rigctld::Tones {
+                    tone_on: flag(6).ok_or(ENAVAIL)?,
+                    ctcss_on: flag(7).ok_or(ENAVAIL)?,
+                    dcs_on: flag(8).ok_or(ENAVAIL)?,
+                    cross_on: flag(9).ok_or(ENAVAIL)?,
+                    tone: tone(12).ok_or(ENAVAIL)?,
+                    ctcss: tone(13).ok_or(ENAVAIL)?,
+                    dcs: get(14).and_then(|k| rigctld::DCS_CODES.get(k).copied()).ok_or(ENAVAIL)?,
+                };
+                Ok(Resp::Tones(tones))
+            }
             Req::GetShift | Req::GetOffset if cat_ok => {
                 // FO fields: 2 is the offset in Hz; the shift direction's field differs by model (profile)
                 let band = self.band;
