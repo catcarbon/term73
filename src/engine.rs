@@ -150,10 +150,6 @@ pub enum Job {
     FreqHz(Reply<u64>),
     /// Longest time the transmitter may stay keyed before term73 unkeys it (default 60 s).
     PttLimit(Duration),
-    /// The data band, when a transmit could start now and that band has CTRL; else None.
-    CtrlOnDataBand(Reply<Option<u8>>),
-    /// Turn CTRL off for the next session (BC p,p), and back on when packet mode ends.
-    MoveCtrl(bool),
     /// A Hamlib rigctld request from the rig-control server.
     Rig(rigctld::Req, Sender<Result<rigctld::Resp, i32>>),
     RigCaps(Sender<rigctld::Caps>),
@@ -290,10 +286,6 @@ struct Engine {
     leave_kiss_pending: bool,
     /// A band a connect took off a memory channel, put back when packet mode ends.
     memory_restore: Option<gateways::MemorySpot>,
-    /// The next session moves CTRL off the data band.
-    move_ctrl: bool,
-    /// BC (CTRL, PTT) to put back when packet mode ends.
-    ctrl_restore: Option<(u8, u8)>,
     running: bool,
 }
 
@@ -338,7 +330,7 @@ impl Engine {
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
             monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, bands: None, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
-            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, memory_restore: None, move_ctrl: false, ctrl_restore: None, running: true,
+            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, memory_restore: None, running: true,
         };
         e.publish();
         e
@@ -586,15 +578,6 @@ impl Engine {
                 let _ = reply.send(r);
             }
             Job::PttLimit(d) => self.ptt_max = d,
-            Job::CtrlOnDataBand(reply) => {
-                let ready = self.tx_allowed && self.cfg.callsign.is_some() && self.modem.is_none() && !self.kiss;
-                if ready && let Some(r) = self.radio.as_deref_mut() {
-                    self.bands = read_bands(r);
-                }
-                let _ = reply.send(Ok(self.bands.filter(|_| ready && self.radio.is_some())
-                    .filter(|&(ctrl, ptt)| ctrl == self.band && ctrl != ptt).map(|_| self.band)));
-            }
-            Job::MoveCtrl(on) => self.move_ctrl = on,
             Job::FreqHz(reply) => {
                 let r = self.freq_hz();
                 let _ = reply.send(r);
@@ -832,48 +815,8 @@ impl Engine {
         self.put_memory_back();
     }
 
-    /// Enter packet mode, turning CTRL off first when the user agreed to it; CTRL comes back if that fails.
-    fn enter_kiss_ctrl_off(&mut self) -> Result<(), String> {
-        self.move_ctrl_off_data_band();
-        let r = self.enter_kiss();
-        if r.is_err() {
-            self.put_memory_back();
-        }
-        r
-    }
-
-    /// Before a session: turn CTRL off when the user agreed to it. BC with CTRL equal to PTT has no CTRL band.
-    fn move_ctrl_off_data_band(&mut self) {
-        if !std::mem::take(&mut self.move_ctrl) || self.kiss || self.modem.is_some() {
-            return;
-        }
-        let Some(r) = self.radio.as_deref_mut() else { return };
-        let Some((ctrl, ptt)) = read_bands(r) else { return };
-        if ctrl != self.band || ctrl == ptt {
-            return;
-        }
-        let _ = cat::cat(r, &format!("BC {ptt},{ptt}"), Duration::from_secs(2), false);
-        self.bands = read_bands(r);
-        if self.bands == Some((ptt, ptt)) {
-            self.ctrl_restore = Some((ctrl, ptt));
-            self.say("CTRL off for this session");
-        } else {
-            self.say("warning: could not turn CTRL off");
-        }
-    }
-
-    /// Return a band that a connect took off a memory channel, and CTRL where it was.
+    /// Return a band that a connect took off a memory channel.
     fn put_memory_back(&mut self) {
-        if let Some((ctrl, ptt)) = self.ctrl_restore.take()
-            && let Some(r) = self.radio.as_deref_mut() {
-                let _ = cat::cat(r, &format!("BC {ctrl},{ptt}"), Duration::from_secs(2), false);
-                self.bands = read_bands(r);
-                if self.bands == Some((ctrl, ptt)) {
-                    self.say(format!("CTRL back on band {}", band_name(ctrl)));
-                } else {
-                    self.say("warning: could not turn CTRL back on");
-                }
-            }
         let Some(spot) = self.memory_restore.take() else { return };
         let Some(r) = self.radio.as_deref_mut() else { return };
         match gateways::restore_memory(r, &spot) {
@@ -966,10 +909,9 @@ impl Engine {
         }
         if let Some(f) = self.freq
             && APRS_MHZ.iter().any(|a| (f - a).abs() < 0.005) {
-                self.move_ctrl = false;
                 return Err(format!("the radio is on {f:.3} MHz, the APRS channel, where connected sessions disrupt APRS: tune elsewhere first (/frequency) or use a saved BBS"));
             }
-        self.enter_kiss_ctrl_off()?;
+        self.enter_kiss()?;
         let mut st = Station::new(self.cfg.callsign.as_deref().unwrap_or("N0CALL"), self.ax_config(call));
         self.ax25_noted = false;
         self.session_since = None;
@@ -994,12 +936,9 @@ impl Engine {
         if self.session_active() {
             return Err("already connected: /disconnect first".into());
         }
-        let tuned = self.tune(b.mhz).and_then(|_| self.power(self.prof.power_high.unwrap_or(0)));
-        if tuned.is_err() {
-            self.move_ctrl = false;
-        }
-        tuned?;
-        self.enter_kiss_ctrl_off()?;
+        self.tune(b.mhz)?;
+        self.power(self.prof.power_high.unwrap_or(0))?;
+        self.enter_kiss()?;
         self.set_speed(b.baud);
         self.connect(&b.call, &b.path, None)
     }
@@ -1210,7 +1149,7 @@ impl Engine {
             self.say(format!("winlink: trying {} on {:.3} MHz ({} km)", gw.call, gw.mhz, gw.km));
             let prepared = self.tune(gw.mhz)
                 .and_then(|_| self.power(self.prof.power_high.unwrap_or(0)))
-                .and_then(|_| self.enter_kiss_ctrl_off());
+                .and_then(|_| self.enter_kiss());
             match prepared {
                 Ok(()) => {
                     self.set_speed(gw.baud);
