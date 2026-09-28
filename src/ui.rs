@@ -59,7 +59,8 @@ pub const HELP: &[(&str, &str)] = &[
 /clear   /quit
 Keys: F10 or Alt+letter opens the menus, F1 help, F8 shows or hides the side panels, PageUp/PageDown scroll, Tab completes, Ctrl+C ends a connection (twice to quit), Ctrl+Q or Alt+X quits.
 While connected, / lines that are not term73 commands (like /EX) go to the station; // sends a single /. Ctrl+Z sends Ctrl-Z (ends a BBS message)."),
-    ("advanced", "/advanced cat <command>       send one raw rig-control command, e.g. /advanced cat FQ 1
+    ("advanced", "/advanced cat <command>       send one raw rig-control command, e.g. /advanced cat FQ 1;
+                              memory writes and link-dropping commands are shown first and need a yes
 /advanced watch <read> | off  repeat a read command (e.g. FO 1) every 2 s and show which fields change
 /advanced kiss on|off         switch the radio's TNC by hand
 /advanced modem status        software modem state (control port)
