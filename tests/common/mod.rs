@@ -23,6 +23,8 @@ pub struct Radio {
     pub bc: Option<(u8, u8)>,
     /// Band TX reports as keyed; None follows the PTT band.
     pub tx_band: Option<u8>,
+    /// VM per band: 0 VFO, 1 memory.
+    pub vm: [u8; 2],
     pub keyed: bool,
     pub cat_log: Vec<String>,
     pub to_host: Vec<u8>,       // bytes the radio sends to term73
@@ -51,6 +53,12 @@ impl Radio {
                 l.into()
             }
             l if l.starts_with("FQ ") => format!("FQ {},{:010}", band(&l[3..]), self.freq[band(&l[3..])]),
+            l if l.starts_with("VM ") && l.contains(',') => {
+                let (b, v) = l[3..].split_once(',').unwrap();
+                self.vm[band(b)] = v.parse().unwrap();
+                l.into()
+            }
+            l if l.starts_with("VM ") => format!("VM {},{}", band(&l[3..]), self.vm[band(&l[3..])]),
             "BC" => {
                 let (c, p) = self.bc.unwrap_or((1, 1));
                 format!("BC {c},{p}")

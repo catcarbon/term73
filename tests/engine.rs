@@ -562,3 +562,18 @@ fn rig_ptt_needs_ptt_on_the_data_band() {
     rig.wait_for("keyed band A instead of data band B; unkeyed", None);
     assert!(!rig.radio.lock().unwrap().keyed);
 }
+
+/// Tuning a band that sits on a memory channel first switches it to VFO mode.
+#[test]
+fn tuning_leaves_memory_mode() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("vfo");
+    rig.radio.lock().unwrap().vm[1] = 1;
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    rig.h().send(Job::Tune(145.09));
+    rig.wait_for("band B was on a memory channel; switched it to VFO mode to tune", None);
+    rig.wait_for("tuned to 145.090 MHz", None);
+    let r = rig.radio.lock().unwrap();
+    assert_eq!((r.vm[1], r.freq[1]), (0, 145_090_000));
+}

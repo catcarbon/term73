@@ -599,25 +599,13 @@ impl Engine {
         Ok(())
     }
 
-    fn need_tx(&mut self) -> Result<(), String> {
+    fn need_tx(&self) -> Result<(), String> {
         if !self.tx_allowed {
             return Err("this transmits: /transmit on first".into());
         }
         if self.cfg.callsign.is_none() {
             return Err("no callsign: /config callsign <CALL>".into());
         }
-        // Whether the TNC transmits on the data band or on the PTT band is not verified, so both must match.
-        // In packet mode rig control is unavailable and the last reading stands.
-        if self.modem.is_none() && !self.kiss
-            && let Some(r) = self.radio.as_deref_mut() {
-                self.bands = read_bands(r);
-            }
-        if self.modem.is_none()
-            && let Some((_, ptt)) = self.bands
-            && ptt != self.band {
-                return Err(format!("PTT is on band {} but packet uses band {}: move PTT to band {} first",
-                                   band_name(ptt), band_name(self.band), band_name(self.band)));
-            }
         Ok(())
     }
 
@@ -721,6 +709,17 @@ impl Engine {
         let was = self.kiss;
         self.leave_kiss();
         let shift = self.prof.shift_field.or_else(|| gateways::default_shift_field(self.model.as_deref().unwrap_or("")));
+        let band = self.band;
+        match gateways::ensure_vfo(self.radio.as_deref_mut().ok_or("no radio")?, band) {
+            Ok(true) => self.say(format!("band {} was on a memory channel; switched it to VFO mode to tune", band_name(band))),
+            Ok(false) => {}
+            Err(e) => {
+                if was {
+                    self.enter_kiss()?;
+                }
+                return Err(e);
+            }
+        }
         let r = gateways::tune(self.radio.as_deref_mut().ok_or("no radio")?, self.band, mhz, shift);
         if r.is_ok() {
             self.freq = Some(mhz);

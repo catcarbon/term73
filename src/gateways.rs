@@ -137,6 +137,22 @@ pub fn radio_model(link: &mut dyn Link) -> Option<String> {
     r.strip_prefix("ID ").map(|m| m.trim().to_string())
 }
 
+/// Put `band` in VFO mode (VM b,0) so a frequency change does not land on a memory channel.
+/// Returns true when it had to switch. A radio without VM is left alone.
+pub fn ensure_vfo(link: &mut dyn Link, band: u8) -> Result<bool, String> {
+    let vm = reply(link, &format!("VM {band}"));
+    let Some(mode) = vm.strip_prefix(&format!("VM {band},")) else { return Ok(false) };
+    if mode == "0" {
+        return Ok(false);
+    }
+    cat::cat(link, &format!("VM {band},0"), T, false).map_err(|e| e.to_string())?;
+    let back = reply(link, &format!("VM {band}"));
+    if back != format!("VM {band},0") {
+        return Err(format!("could not switch band {band} to VFO mode (it answered {back:?})"));
+    }
+    Ok(true)
+}
+
 /// Set `band` to `mhz`, read it back, and require FM with no repeater shift.
 pub fn tune(link: &mut dyn Link, band: u8, mhz: f64, shift_field: Option<usize>) -> Result<(), String> {
     let want = format!("{:010}", (mhz * 1e6).round() as u64);
