@@ -144,7 +144,13 @@ fn turbo_menus_run_commands() {
         term.draw(|f| app.draw(f)).unwrap();
         term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
     };
-    let s = screen(&mut app);
+    // the callsign reaches the screen once the engine has published its first snapshot
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut s = screen(&mut app);
+    while !s.contains("N0CALL") && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+        s = screen(&mut app);
+    }
     for needle in ["Radio", "Channel", "Winlink", "[■] term73", " Rig ", " Stations ", "F10 Menu", "N0CALL"] {
         assert!(s.contains(needle), "screen lacks {needle:?}");
     }

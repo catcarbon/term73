@@ -500,3 +500,26 @@ fn bbs_remembers_its_ax25_version() {
     rig.wait_for("connected to N0BBS-3 (AX.25 v2.0)", Some(&mut b));
     assert!(!rig.text.contains("does not use AX.25 v2.2"));
 }
+
+/// A raw TX from /advanced cat gets the same transmit time limit as PTT from rig control.
+#[test]
+fn raw_tx_is_unkeyed_by_the_time_limit() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("txlimit");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    rig.h().send(Job::PttLimit(Duration::from_millis(300)));
+    rig.h().send(Job::Cat("TX".into()));
+    rig.wait_for("refused: TX can transmit", None);
+    assert!(!rig.radio.lock().unwrap().keyed);
+    rig.h().send(Job::SetTransmit(true));
+    rig.h().send(Job::Cat("TX".into()));
+    rig.wait_for("TX -> TX 0", None);
+    assert!(rig.radio.lock().unwrap().keyed);
+    rig.wait_for("unkeying", None);
+    let end = Instant::now() + Duration::from_secs(5);
+    while rig.radio.lock().unwrap().keyed {
+        assert!(Instant::now() < end, "the time limit did not send RX");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

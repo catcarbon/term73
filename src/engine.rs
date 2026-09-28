@@ -146,6 +146,8 @@ pub enum Job {
     CurrentProfile(Reply<(Option<String>, RadioProfile)>),
     Ptt(bool, Reply<bool>),
     FreqHz(Reply<u64>),
+    /// Longest time the transmitter may stay keyed before term73 unkeys it (default 60 s).
+    PttLimit(Duration),
     /// A Hamlib rigctld request from the rig-control server.
     Rig(rigctld::Req, Sender<Result<rigctld::Resp, i32>>),
     RigCaps(Sender<rigctld::Caps>),
@@ -384,8 +386,17 @@ impl Engine {
             }
             Job::Cat(line) => {
                 self.need_cat()?;
+                cat::check_allowed(&line, self.tx_allowed).map_err(|e| format!("refused: {e}"))?;
+                // a raw TX keys the transmitter like PTT does, so it gets the same time limit
+                let name: String = line.trim().chars().take(2).collect::<String>().to_ascii_uppercase();
+                if name == "TX" {
+                    self.keyed_at.get_or_insert_with(Instant::now);
+                }
                 let r = cat::cat(self.radio.as_deref_mut().unwrap(), &line, Duration::from_secs(2), self.tx_allowed)
                     .map_err(|e| format!("refused: {e}"))?;
+                if name == "RX" {
+                    self.keyed_at = None;
+                }
                 self.say(format!("{} -> {}", line.trim(), if r.is_empty() { "(no reply)" } else { &r }));
             }
             Job::Watch(None) => {
@@ -529,6 +540,7 @@ impl Engine {
                 let r = self.ptt(on);
                 let _ = reply.send(r);
             }
+            Job::PttLimit(d) => self.ptt_max = d,
             Job::FreqHz(reply) => {
                 let r = self.freq_hz();
                 let _ = reply.send(r);
