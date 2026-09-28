@@ -578,6 +578,32 @@ fn tuning_leaves_memory_mode() {
     assert_eq!((r.vm[1], r.freq[1]), (0, 145_090_000));
 }
 
+/// A memory write is shown field by field and sent only once confirmed; resets stay refused.
+#[test]
+fn memory_write_needs_confirmation() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("mewrite");
+    let now = "ME 054,0446475000,0005000000,9,9,0,0,0,0,1,0,0,0,18,18,000,3,CQCQCQ,0,00,0";
+    rig.radio.lock().unwrap().memories.insert("054".into(), now.into());
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    let preview = |line: &str| rig.h().ask(|tx| Job::CatPreview(line.into(), tx), Duration::from_secs(10));
+    let write = "ME 054,0446475000,0005000000,9,9,0,0,0,0,1,1,0,0,18,18,000,3,CQCQCQ,0,00,0";
+    let shown = preview(write).unwrap().expect("a memory write needs confirmation");
+    assert_eq!(shown, "this changes memory 054:
+  reverse: 0 -> 1");
+    assert_eq!(preview("FQ 1").unwrap(), None, "reads need no confirmation");
+    assert!(preview("SR").is_err(), "a reset is refused outright");
+    rig.h().send(Job::Cat(write.into()));
+    rig.wait_for("refused: ME with more than a channel number", None);
+    assert_eq!(rig.radio.lock().unwrap().memories["054"], now);
+    rig.h().send(Job::CatConfirmed(write.into()));
+    rig.wait_for(&format!("{write} -> {write}"), None);
+    assert_eq!(rig.radio.lock().unwrap().memories["054"], write);
+    rig.h().send(Job::CatConfirmed("SR".into()));
+    rig.wait_for("refused: SR is a reset or service command", None);
+}
+
 /// A connect takes the data band off its memory channel, and packet mode ending puts it back.
 #[test]
 fn connect_puts_the_memory_channel_back() {

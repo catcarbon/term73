@@ -89,6 +89,57 @@ pub enum Refused {
     DropsLink(&'static str),
 }
 
+impl Refused {
+    /// A setting the user may still send after seeing what it does; resets and transmitting are never confirmable.
+    pub fn confirmable(&self) -> bool {
+        matches!(self, Refused::PowerOff | Refused::MemoryWrite | Refused::DropsLink(_))
+    }
+}
+
+/// ME record fields on the TM-D750 (the TH-D75 has two more after the mode).
+const ME_FIELDS: [&str; 21] = [
+    "channel", "frequency", "offset (TX frequency when split)", "RX step", "TX step", "mode", "tone", "CTCSS", "DCS",
+    "cross tone", "reverse", "split", "shift", "tone index", "CTCSS index", "DCS index", "cross type", "UR call",
+    "digital squelch", "digital code", "lockout",
+];
+
+fn me_fields(record: &str) -> Vec<&str> {
+    record.trim().get(3..).unwrap_or("").split(',').collect()
+}
+
+/// What "ME ccc,..." would do to a channel whose current read is `current` ("N" when empty).
+pub fn describe_memory_write(current: &str, command: &str) -> String {
+    let command = command.trim();
+    let channel = command.get(3..6).unwrap_or("?");
+    let new = command.split_once(',').map(|(_, rest)| rest).unwrap_or("");
+    let empty = current.trim() == "N" || current.trim().is_empty();
+    let name = |i: usize| ME_FIELDS.get(i).map(|n| n.to_string()).unwrap_or(format!("field {i}"));
+    if new.is_empty() {
+        return if empty {
+            format!("memory {channel} is already empty")
+        } else {
+            format!("this erases memory {channel}, which now holds:\n  {}", current.trim())
+        };
+    }
+    let after = me_fields(command);
+    if empty {
+        let lines: Vec<String> = after.iter().enumerate().skip(1).map(|(i, v)| format!("  {}: {v}", name(i))).collect();
+        return format!("memory {channel} is empty; this stores:\n{}", lines.join("\n"));
+    }
+    let before = me_fields(current);
+    let lines: Vec<String> = (1..before.len().max(after.len()))
+        .filter_map(|i| {
+            let (x, y) = (before.get(i).copied().unwrap_or("-"), after.get(i).copied().unwrap_or("-"));
+            (x != y).then(|| format!("  {}: {x} -> {y}", name(i)))
+        })
+        .collect();
+    if lines.is_empty() {
+        format!("this rewrites memory {channel} with the same settings")
+    } else {
+        format!("this changes memory {channel}:\n{}", lines.join("\n"))
+    }
+}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -150,13 +201,25 @@ pub fn drain(link: &mut dyn Link, quiet: Duration) -> Vec<u8> {
 /// the reply; stale and unrelated lines (some radios repeat replies) are skipped.
 pub fn cat(link: &mut dyn Link, line: &str, timeout: Duration, allow_tx: bool) -> Result<String, Refused> {
     check_allowed(line, allow_tx)?;
+    Ok(send(link, line, timeout))
+}
+
+/// Like `cat`, for a command the user confirmed: only resets, service commands and unallowed transmitting are refused.
+pub fn cat_confirmed(link: &mut dyn Link, line: &str, timeout: Duration, allow_tx: bool) -> Result<String, Refused> {
+    match check_allowed(line, allow_tx) {
+        Err(e) if !e.confirmable() => Err(e),
+        _ => Ok(send(link, line, timeout)),
+    }
+}
+
+fn send(link: &mut dyn Link, line: &str, timeout: Duration) -> String {
     let line = line.trim();
     let name: String = line.chars().take(2).collect::<String>().to_ascii_uppercase();
     drain(link, Duration::from_millis(150));
     let mut out = line.as_bytes().to_vec();
     out.push(b'\r');
     if link.write(&out).is_err() {
-        return Ok(String::new());
+        return String::new();
     }
     let mut buf: Vec<u8> = Vec::new();
     let end = Instant::now() + timeout;
@@ -169,11 +232,11 @@ pub fn cat(link: &mut dyn Link, line: &str, timeout: Duration, allow_tx: bool) -
             let raw: Vec<u8> = buf.drain(..=pos).collect();
             let reply = String::from_utf8_lossy(&raw[..raw.len() - 1]).trim().to_string();
             if reply == "?" || reply == "N" || reply.get(..2).map(|p| p.eq_ignore_ascii_case(&name)) == Some(true) {
-                return Ok(reply);
+                return reply;
             }
         }
     }
-    Ok(String::from_utf8_lossy(&buf).trim().to_string())
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 /// Leave KISS mode. Some radios act on a KISS frame only when the next byte
@@ -190,6 +253,18 @@ pub fn kiss_off(link: &mut dyn Link) {
 mod tests {
     use super::*;
     use crate::link::testing::EchoRadio;
+
+    #[test]
+    fn memory_write_is_described_field_by_field() {
+        let now = "ME 054,0446475000,0005000000,9,9,0,0,0,0,1,0,0,0,18,18,000,3,CQCQCQ,0,00,0";
+        let d = describe_memory_write(now, "ME 054,0446475000,0446475000,9,9,0,0,0,0,1,0,1,0,18,18,000,3,CQCQCQ,0,00,0");
+        assert!(d.contains("offset (TX frequency when split): 0005000000 -> 0446475000"), "{d}");
+        assert!(d.contains("split: 0 -> 1"), "{d}");
+        assert_eq!(d.lines().count(), 3, "{d}");
+        assert!(describe_memory_write(now, "ME 054,").starts_with("this erases memory 054"));
+        assert!(describe_memory_write("N", "ME 999,0146520000").contains("memory 999 is empty; this stores:\n  frequency: 0146520000"));
+        assert!(Refused::MemoryWrite.confirmable() && !Refused::ResetOrService("SR".into()).confirmable());
+    }
 
     #[test]
     fn safety_rules() {

@@ -150,6 +150,10 @@ pub enum Job {
     FreqHz(Reply<u64>),
     /// Longest time the transmitter may stay keyed before term73 unkeys it (default 60 s).
     PttLimit(Duration),
+    /// What a raw CAT line would do when it needs the user's confirmation: None when it can be sent as is.
+    CatPreview(String, Reply<Option<String>>),
+    /// A raw CAT line the user confirmed after seeing its preview.
+    CatConfirmed(String),
     /// A Hamlib rigctld request from the rig-control server.
     Rig(rigctld::Req, Sender<Result<rigctld::Resp, i32>>),
     RigCaps(Sender<rigctld::Caps>),
@@ -417,6 +421,15 @@ impl Engine {
             Job::Close => {
                 self.close_rig();
                 self.say("rig disconnected");
+            }
+            Job::CatPreview(line, reply) => {
+                let _ = reply.send(self.cat_preview(&line));
+            }
+            Job::CatConfirmed(line) => {
+                self.need_cat()?;
+                let r = cat::cat_confirmed(self.radio.as_deref_mut().unwrap(), &line, Duration::from_secs(2), self.tx_allowed)
+                    .map_err(|e| format!("refused: {e}"))?;
+                self.say(format!("{} -> {}", line.trim(), if r.is_empty() { "(no reply)" } else { &r }));
             }
             Job::Cat(line) => {
                 self.need_cat()?;
@@ -899,6 +912,27 @@ impl Engine {
         if changed {
             let _ = config::save_bbs(&all);
         }
+    }
+
+    /// For a raw CAT line: Err when it is never sent, Some(what it does) when it needs a yes first.
+    fn cat_preview(&mut self, line: &str) -> Result<Option<String>, String> {
+        self.need_cat()?;
+        let e = match cat::check_allowed(line, self.tx_allowed) {
+            Ok(()) => return Ok(None),
+            Err(e) if !e.confirmable() => return Err(format!("refused: {e}")),
+            Err(e) => e,
+        };
+        if e != cat::Refused::MemoryWrite {
+            return Ok(Some(e.to_string()));
+        }
+        let line = line.trim().to_ascii_uppercase();
+        let channel = line.get(3..).and_then(|a| a.split(',').next()).unwrap_or("");
+        if channel.len() != 3 || !channel.chars().all(|c| c.is_ascii_digit()) {
+            return Err("ME needs a three-digit channel, e.g. ME 054,...".into());
+        }
+        let current = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("ME {channel}"), Duration::from_secs(2), false)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(cat::describe_memory_write(&current, &line)))
     }
 
     fn connect(&mut self, call: &str, path: &[String], attempts: Option<u32>) -> Result<(), String> {

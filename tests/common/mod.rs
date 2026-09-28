@@ -28,6 +28,8 @@ pub struct Radio {
     /// MR per band: memory channel number.
     pub mr: [u16; 2],
     pub keyed: bool,
+    /// Memory channels by number, as ME records.
+    pub memories: std::collections::BTreeMap<String, String>,
     pub cat_log: Vec<String>,
     pub to_host: Vec<u8>,       // bytes the radio sends to term73
     pub to_air: Vec<Vec<u8>>,   // AX.25 frames the radio transmitted
@@ -67,6 +69,16 @@ impl Radio {
                 l.into()
             }
             l if l.starts_with("MR ") => format!("MR {:03}", self.mr[band(&l[3..])]),
+            l if l.starts_with("ME ") && l.contains(',') => {
+                let (ch, rest) = l[3..].split_once(',').unwrap();
+                if rest.is_empty() {
+                    self.memories.remove(ch);
+                } else {
+                    self.memories.insert(ch.to_string(), l.to_string());
+                }
+                l.into()
+            }
+            l if l.starts_with("ME ") => self.memories.get(&l[3..]).cloned().unwrap_or_else(|| "N".into()),
             "BC" => {
                 let (c, p) = self.bc.unwrap_or((1, 1));
                 format!("BC {c},{p}")

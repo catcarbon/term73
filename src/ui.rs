@@ -764,6 +764,30 @@ impl App {
         }
     }
 
+    /// Send a raw CAT line; one that writes memory or can cut the link is shown first and needs a yes.
+    fn cat_with_confirm(&mut self, line: String) {
+        self.wizard(move |c| {
+            match c.call(|r| Job::CatPreview(line.clone(), r)) {
+                Ok(None) => {}
+                Ok(Some(what)) => {
+                    c.say(format!("{}: {what}", line.trim()));
+                    if !c.ask("Send it? (y/n)", Some("n"), false)?.trim().to_ascii_lowercase().starts_with('y') {
+                        c.say("not sent");
+                        return Ok(());
+                    }
+                    let _ = c.jobs.send(Job::CatConfirmed(line));
+                    return Ok(());
+                }
+                Err(e) => {
+                    c.say(format!("error: {e}"));
+                    return Ok(());
+                }
+            }
+            let _ = c.jobs.send(Job::Cat(line));
+            Ok(())
+        });
+    }
+
     /// F8: show or hide the side panels.
     pub fn toggle_side(&mut self) {
         self.side_hidden = !self.side_hidden;
@@ -981,7 +1005,7 @@ impl App {
                 }
             },
             "/advanced" => match (sub.as_str(), rest.first().map(|s| s.to_ascii_lowercase()).as_deref()) {
-                ("cat", _) => e.send(Job::Cat(rest.join(" "))),
+                ("cat", _) => self.cat_with_confirm(rest.join(" ")),
                 ("watch", Some("off")) => e.send(Job::Watch(None)),
                 ("watch", Some(_)) => e.send(Job::Watch(Some(rest.join(" ")))),
                 ("kiss", Some("on")) => e.send(Job::KissOn),
