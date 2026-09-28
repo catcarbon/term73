@@ -77,6 +77,19 @@ fn scripted_session() {
     assert_eq!(radio.lock().unwrap().freq[1], 145_090_000);
     type_line(&mut app, "/advanced cat ID");
     wait(&mut app, |a| text(a).contains("ID -> ID TM-D750"), "rig control");
+    // a memory write shows what changes and waits for a yes
+    let old = "ME 054,0446475000,0005000000,9,9,0,0,0,0,1,0,0,0,18,18,000,3,CQCQCQ,0,00,0";
+    let new = "ME 054,0446475000,0005000000,9,9,0,0,0,0,1,1,0,0,18,18,000,3,CQCQCQ,0,00,0";
+    radio.lock().unwrap().memories.insert("054".into(), old.into());
+    type_line(&mut app, &format!("/advanced cat {new}"));
+    wait(&mut app, |a| a.waiting_for_answer() && text(a).contains("reverse: 0 -> 1"), "the write preview");
+    answer(&mut app, "n");
+    wait(&mut app, |a| text(a).contains("not sent"), "a declined write");
+    assert_eq!(radio.lock().unwrap().memories["054"], old);
+    type_line(&mut app, &format!("/advanced cat {new}"));
+    answer(&mut app, "y");
+    wait(&mut app, |a| text(a).contains(&format!("{new} -> {new}")), "a confirmed write");
+    assert_eq!(radio.lock().unwrap().memories["054"], new);
     type_line(&mut app, "/connect N0BBS-3");
     wait(&mut app, |a| text(a).contains("this transmits: /transmit on first"), "transmit guard");
     type_line(&mut app, "hello");

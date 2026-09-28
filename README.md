@@ -25,6 +25,7 @@ term73 is a terminal program for packet radio that aims to quickly add support f
 - Keying commands are disabled on each start. Use `/transmit on` to enable.
 - Discovery only sends read commands from a known list.
 - Reset and service commands are not allowed.
+- A raw command that writes or erases a memory channel, or could cut the connection, shows what it would change and is sent only after a yes.
 - When term73 is configured to use an interface that has control of a radio, term73 only communicates with the interface through their API.
 
 ## Requirements
