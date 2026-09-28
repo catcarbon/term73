@@ -20,6 +20,7 @@ pub const ENAVAIL: i32 = 11;
 /// Hamlib bit values used in `\dump_state`.
 const MODE_AM: u64 = 1 << 0;
 const MODE_FM: u64 = 1 << 5;
+const MODE_DSTAR: u64 = 1 << 24;
 const LEVEL_RFPOWER: u64 = 1 << 12;
 const VFO_A: u32 = 1 << 0;
 const VFO_B: u32 = 1 << 1;
@@ -31,12 +32,17 @@ pub enum Req {
     GetFreq,
     SetFreq(u64),
     GetMode,
+    /// Hamlib mode name, upper case ("FM", "AM").
+    SetMode(String),
     GetPtt,
     SetPtt(bool),
     GetDcd,
     GetPower,
     SetPower(f32),
     GetVfo,
+    /// Repeater shift direction and offset (read only).
+    GetShift,
+    GetOffset,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +54,8 @@ pub enum Resp {
     Level(f32),
     /// Data band: 0 = A, 1 = B.
     Band(u8),
+    /// Hamlib repeater shift: "None", "+" or "-".
+    Shift(&'static str),
 }
 
 /// What the rig can do, reported to clients in `\dump_state`.
@@ -110,6 +118,36 @@ fn rprt(code: i32) -> String {
     format!("RPRT {}\n", if code == 0 { 0 } else { -code.abs() })
 }
 
+/// Kenwood `MD` mode codes on the TM-D750 and TH-D75: 0 FM, 1 DV, 2 AM, 4 DR (DV via a repeater); 3 is not known.
+/// Returns the Hamlib mode name and a nominal passband in Hz.
+pub fn kenwood_mode(code: u8) -> Option<(&'static str, u32)> {
+    match code {
+        0 => Some(("FM", 15000)),
+        1 | 4 => Some(("D-STAR", 6250)),
+        2 => Some(("AM", 10000)),
+        _ => None,
+    }
+}
+
+/// The `MD` code to set for a Hamlib mode name. Only FM and AM are offered: DV and DR need D-STAR settings.
+pub fn kenwood_mode_code(name: &str) -> Option<u8> {
+    match name {
+        "FM" => Some(0),
+        "AM" => Some(2),
+        _ => None,
+    }
+}
+
+/// Kenwood `FO` repeater-shift codes: 0 none, 1 plus, 2 minus.
+pub fn kenwood_shift(code: u8) -> Option<&'static str> {
+    match code {
+        0 => Some("None"),
+        1 => Some("+"),
+        2 => Some("-"),
+        _ => None,
+    }
+}
+
 /// Power levels are reported as fractions of full power: high 1.0, mid 0.5, low 0.2 (coarse; the radio has three steps).
 pub fn level_to_fraction(level: u8) -> f32 {
     match level {
@@ -132,6 +170,9 @@ pub fn answer(line: &str, handler: &Handler, caps: &CapsFn, keyed: &mut bool) ->
         "" => return Some(String::new()),
         "q" | "Q" | "\\quit" => return None,
         "\\chk_vfo" => "0\n".into(),
+        // Hamlib's network client asks this before every set_mode and reads the value and then a
+        // report line; without the report line it waits out its timeout (about 20 s)
+        "\\get_lock_mode" => format!("0\n{}", rprt(0)),
         "\\dump_state" => dump_state(&caps()),
         "\\get_powerstat" => "1\n".into(),
         "_" | "\\get_info" => format!("{}\n", caps().model),
@@ -152,26 +193,31 @@ pub fn answer(line: &str, handler: &Handler, caps: &CapsFn, keyed: &mut bool) ->
             Ok(_) => rprt(ENIMPL),
             Err(e) => rprt(e),
         },
-        // only the current mode can be "set"; changing modes is not confirmed on the rig
-        "M" | "\\set_mode" => match (arg(1), handler(Req::GetMode)) {
-            (Some(want), Ok(Resp::Mode(m, _))) if want.eq_ignore_ascii_case(m) => rprt(0),
-            (Some(_), _) => rprt(ENAVAIL),
-            (None, _) => rprt(EINVAL),
+        "M" | "\\set_mode" => match arg(1) {
+            Some(want) => match handler(Req::SetMode(want.to_ascii_uppercase())) {
+                Ok(_) => rprt(0),
+                Err(e) => rprt(e),
+            },
+            None => rprt(EINVAL),
         },
-        "v" | "\\get_vfo" => match handler(Req::GetVfo) {
-            Ok(Resp::Band(b)) => format!("{}\n", if b == 0 { "VFOA" } else { "VFOB" }),
+        // Clients control only the radio's data band, which is always presented as VFOA: Hamlib's
+        // client queries VFOA by default and stalls on set_mode when the current VFO is another one.
+        "v" | "\\get_vfo" => "VFOA\n".into(),
+        "V" | "\\set_vfo" => match arg(1) {
+            Some(v) if ["VFOA", "currVFO", "Main"].iter().any(|n| v.eq_ignore_ascii_case(n)) => rprt(0),
+            Some(_) => rprt(ENAVAIL),
+            None => rprt(EINVAL),
+        },
+        "s" | "\\get_split_vfo" => "0\nVFOA\n".into(),
+        "r" | "\\get_rptr_shift" => match handler(Req::GetShift) {
+            Ok(Resp::Shift(s)) => format!("{s}\n"),
             Ok(_) => rprt(ENIMPL),
             Err(e) => rprt(e),
         },
-        "V" | "\\set_vfo" => match (arg(1), handler(Req::GetVfo)) {
-            (Some(v), Ok(Resp::Band(b))) if v.eq_ignore_ascii_case(if b == 0 { "VFOA" } else { "VFOB" })
-                || v.eq_ignore_ascii_case("currVFO") => rprt(0),
-            (Some(_), _) => rprt(ENAVAIL),
-            (None, _) => rprt(EINVAL),
-        },
-        "s" | "\\get_split_vfo" => match handler(Req::GetVfo) {
-            Ok(Resp::Band(b)) => format!("0\n{}\n", if b == 0 { "VFOA" } else { "VFOB" }),
-            _ => "0\nVFOA\n".into(),
+        "o" | "\\get_rptr_offs" => match handler(Req::GetOffset) {
+            Ok(Resp::Freq(hz)) => format!("{hz}\n"),
+            Ok(_) => rprt(ENIMPL),
+            Err(e) => rprt(e),
         },
         "S" | "\\set_split_vfo" => if arg(1) == Some("0") { rprt(0) } else { rprt(ENAVAIL) },
         "t" | "\\get_ptt" => match handler(Req::GetPtt) {
@@ -226,7 +272,7 @@ pub fn dump_state(c: &Caps) -> String {
     };
     s.push_str("1\n2\n0\n"); // protocol 1, model 2 (NET rigctl), region
     for r in &c.rx {
-        range(&mut s, *r, MODE_FM | MODE_AM, -1);
+        range(&mut s, *r, MODE_FM | MODE_AM | MODE_DSTAR, -1);
     }
     s.push_str("0 0 0 0 0 0 0\n");
     for r in &c.tx {
@@ -257,7 +303,10 @@ fn serve(conn: TcpStream, handler: &Handler, caps: &CapsFn, log: &LogFn) {
     let mut keyed = false;
     for line in BufReader::new(conn).lines() {
         let Ok(line) = line else { break };
-        let Some(reply) = answer(&line, handler, caps, &mut keyed) else { break };
+        let Some(reply) = answer(&line, handler, caps, &mut keyed) else {
+            let _ = out.write_all(rprt(0).as_bytes()); // the client reads a reply to quit
+            break;
+        };
         if out.write_all(reply.as_bytes()).is_err() {
             break;
         }
@@ -283,7 +332,7 @@ mod tests {
         let d = dump_state(&caps());
         let lines: Vec<&str> = d.lines().collect();
         assert_eq!(&lines[..3], ["1", "2", "0"]);
-        assert_eq!(lines[3], "118000000 174000000 0x21 -1 -1 0x3 0x0");
+        assert_eq!(lines[3], "118000000 174000000 0x1000021 -1 -1 0x3 0x0");
         assert_eq!(lines[4], "0 0 0 0 0 0 0");
         assert_eq!(lines[5], "144000000 148000000 0x20 1000 50000 0x3 0x0");
         assert!(d.contains("\n0 0\n0x20 15000\n0x1 10000\n0 0\n0\n0\n0\n0\n\n\n0x0\n0x0\n0x1000\n0x1000\n0x0\n0x0\nvfo_ops=0x0\nptt_type=0x0\n"), "{d}");
@@ -302,6 +351,8 @@ mod tests {
                 }
                 Req::SetFreq(_) => Err(EINVAL),
                 Req::GetMode => Ok(Resp::Mode("FM", 15000)),
+                Req::SetMode(m) if m == "FM" => Ok(Resp::Done),
+                Req::SetMode(_) => Err(ENAVAIL),
                 Req::GetVfo => Ok(Resp::Band(1)),
                 Req::GetPower => Ok(Resp::Level(level_to_fraction(1))),
                 Req::SetPtt(_) => Err(ERJCTED),
@@ -318,7 +369,11 @@ mod tests {
         assert_eq!(ask("m"), "FM\n15000\n");
         assert_eq!(ask("M FM 15000"), "RPRT 0\n");
         assert_eq!(ask("M USB 2400"), "RPRT -11\n");
-        assert_eq!(ask("v"), "VFOB\n");
+        assert_eq!(kenwood_mode(2), Some(("AM", 10000)));
+        assert_eq!(kenwood_mode(4).map(|m| m.0), Some("D-STAR"));
+        assert_eq!(kenwood_mode(3), None);
+        assert_eq!((kenwood_mode_code("AM"), kenwood_mode_code("D-STAR")), (Some(2), None));
+        assert_eq!(ask("v"), "VFOA\n");
         assert_eq!(ask("l RFPOWER"), "0.500000\n");
         assert_eq!(ask("l SQL"), "RPRT -11\n");
         assert_eq!(ask("T 1"), "RPRT -9\n");

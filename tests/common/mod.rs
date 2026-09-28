@@ -16,6 +16,8 @@ pub struct Radio {
     pub pending_exit: bool,
     pub freq: [u64; 2],
     pub power: [u8; 2],
+    /// MD codes per band: 0 FM, 2 AM.
+    pub mode: [u8; 2],
     pub keyed: bool,
     pub cat_log: Vec<String>,
     pub to_host: Vec<u8>,       // bytes the radio sends to term73
@@ -41,7 +43,12 @@ impl Radio {
                 l.into()
             }
             l if l.starts_with("FQ ") => format!("FQ {},{:010}", band(&l[3..]), self.freq[band(&l[3..])]),
-            l if l.starts_with("MD ") => format!("MD {},0", band(&l[3..])),
+            l if l.starts_with("MD ") && l.contains(',') => {
+                let (b, m) = l[3..].split_once(',').unwrap();
+                self.mode[band(b)] = m.parse().unwrap();
+                l.into()
+            }
+            l if l.starts_with("MD ") => format!("MD {},{}", band(&l[3..]), self.mode[band(&l[3..])]),
             l if l.starts_with("FO ") => format!("FO {},{:010},0000600000,2,2,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00", band(&l[3..]), self.freq[band(&l[3..])]),
             l if l.starts_with("PC ") && l.contains(',') => {
                 let (b, v) = l[3..].split_once(',').unwrap();

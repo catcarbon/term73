@@ -1140,10 +1140,39 @@ impl Engine {
                 let band = self.band;
                 let r = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("MD {band}"), Duration::from_secs(2), false)
                     .unwrap_or_default();
-                if r == format!("MD {band},0") { Ok(Resp::Mode("FM", 15000)) } else { Err(ENAVAIL) }
+                r.strip_prefix(&format!("MD {band},")).and_then(|c| c.parse().ok()).and_then(rigctld::kenwood_mode)
+                    .map(|(m, pb)| Resp::Mode(m, pb)).ok_or(ENAVAIL)
+            }
+            Req::SetMode(name) => {
+                let code = rigctld::kenwood_mode_code(&name).ok_or(ENAVAIL)?;
+                if self.modem.is_some() || self.radio.is_none() {
+                    return Err(ENAVAIL);
+                }
+                if self.session_active() || self.kiss {
+                    return Err(ERJCTED); // packet mode needs FM; do not change it under a session or /listen
+                }
+                let band = self.band;
+                let r = self.radio.as_deref_mut().unwrap();
+                let _ = cat::cat(r, &format!("MD {band},{code}"), Duration::from_secs(2), false);
+                let back = cat::cat(r, &format!("MD {band}"), Duration::from_secs(2), false).unwrap_or_default();
+                if back == format!("MD {band},{code}") { Ok(Resp::Done) } else { Err(EINVAL) }
             }
             Req::GetMode => Ok(Resp::Mode("FM", 15000)), // term73 only enters packet mode after tuning FM
             Req::GetVfo => Ok(Resp::Band(self.band)),
+            Req::GetShift | Req::GetOffset if cat_ok => {
+                // FO fields: 2 is the offset in Hz; the shift direction's field differs by model (profile)
+                let band = self.band;
+                let shift = self.prof.shift_field.or_else(|| gateways::default_shift_field(self.model.as_deref().unwrap_or("")));
+                let fo = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("FO {band}"), Duration::from_secs(2), false)
+                    .unwrap_or_default();
+                let fields: Vec<&str> = fo.strip_prefix("FO ").unwrap_or("").split(',').collect();
+                if matches!(r, Req::GetOffset) {
+                    fields.get(2).and_then(|v| v.parse().ok()).map(Resp::Freq).ok_or(ENAVAIL)
+                } else {
+                    shift.and_then(|i| fields.get(i)).and_then(|v| v.parse().ok()).and_then(rigctld::kenwood_shift)
+                        .map(Resp::Shift).ok_or(ENAVAIL)
+                }
+            }
             Req::GetPtt => Ok(Resp::Flag(self.keyed_at.is_some())),
             Req::SetPtt(on) => match self.ptt(on) {
                 Ok(true) => Ok(Resp::Done),

@@ -425,6 +425,15 @@ fn rigctl_server_drives_the_engine() {
     assert_eq!(ask("F 7074000", 1), "RPRT -1\n", "outside the rig's bands");
     assert_eq!(ask("l RFPOWER", 1), "0.200000\n");
     assert_eq!(ask("T 1", 1), "RPRT -9\n", "transmit is not allowed");
+    assert_eq!(ask("m", 2), "FM\n15000\n");
+    assert_eq!(ask("M AM 10000", 1), "RPRT 0\n");
+    assert_eq!(ask("m", 2), "AM\n10000\n");
+    assert_eq!(rig.radio.lock().unwrap().mode[1], 2);
+    assert_eq!(ask("M D-STAR 6250", 1), "RPRT -11\n", "DV needs D-STAR settings, so it is not offered");
+    assert_eq!(ask("M FM 15000", 1), "RPRT 0\n");
+    assert_eq!(ask("r", 1), "None\n", "FO field 11 is 0 on the simulated radio");
+    assert_eq!(ask("o", 1), "600000\n", "FO field 2 is the offset in Hz");
+    assert_eq!(ask(r"\get_lock_mode", 2), "0\nRPRT 0\n");
     assert!(ask(r"\dump_state", 1).starts_with('1'));
     assert_eq!(rig.radio.lock().unwrap().freq[1], 146_520_000);
     assert!(!rig.radio.lock().unwrap().keyed);
