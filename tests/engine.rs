@@ -577,3 +577,24 @@ fn tuning_leaves_memory_mode() {
     let r = rig.radio.lock().unwrap();
     assert_eq!((r.vm[1], r.freq[1]), (0, 145_090_000));
 }
+
+/// When the other station ends the session, packet mode is left only after our last frame had time
+/// to go out; leaving at once stranded it in the TNC (the radio showed STA).
+#[test]
+fn packet_mode_ends_after_the_last_frame_is_sent() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("drain");
+    let mut b = bbs("N0BBS-3");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.h().send(Job::SetCallsign("n0call".into()));
+    rig.h().send(Job::SetTransmit(true));
+    rig.h().send(Job::Connect("N0BBS-3".into(), vec![]));
+    rig.wait_for("connected to N0BBS-3", Some(&mut b));
+    b.disconnect(Instant::now());
+    rig.wait_for("*** N0BBS-3 disconnected", Some(&mut b));
+    let answered = Instant::now(); // our UA to the DISC has just been sent
+    assert!(rig.radio.lock().unwrap().kiss, "still in packet mode right after answering");
+    rig.wait_for("radio back to normal operation", None);
+    assert!(answered.elapsed() >= Duration::from_millis(2500), "left packet mode after {:?}", answered.elapsed());
+    assert!(!rig.radio.lock().unwrap().kiss);
+}

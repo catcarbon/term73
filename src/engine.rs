@@ -280,6 +280,10 @@ struct Engine {
     ptt_max: Duration,
     close_wait: Duration,
     last_tx: Option<Instant>,
+    /// Last frame heard from the radio, to tell a busy channel.
+    last_rx: Option<Instant>,
+    /// Packet mode should end once the TNC has sent what it holds.
+    leave_kiss_pending: bool,
     running: bool,
 }
 
@@ -302,6 +306,11 @@ pub fn band_name(b: u8) -> &'static str {
     if b == 0 { "A" } else { "B" }
 }
 
+/// Time for the TNC to send a queued frame: TX delay plus a 256-byte frame at 1200 baud, with margin.
+const TNC_DRAIN: Duration = Duration::from_secs(3);
+/// The channel counts as free once nothing has been heard for this long.
+const CHANNEL_QUIET: Duration = Duration::from_millis(1500);
+
 fn now_utc_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -319,7 +328,7 @@ impl Engine {
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
             monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, bands: None, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
-            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, running: true,
+            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, running: true,
         };
         e.publish();
         e
@@ -381,6 +390,9 @@ impl Engine {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if self.leave_kiss_pending {
+                self.auto_leave_kiss();
             }
             self.poll_watch();
             if let Err(e) = self.service() {
@@ -678,7 +690,13 @@ impl Engine {
         if self.keyed_at.is_some() {
             let _ = self.ptt(false);
         }
+        let end = Instant::now() + self.close_wait.min(Duration::from_secs(5));
+        while self.kiss && !self.tnc_drained() && Instant::now() < end {
+            let _ = self.service();
+            std::thread::sleep(Duration::from_millis(20));
+        }
         self.leave_kiss();
+        self.leave_kiss_pending = false;
         self.radio = None;
         self.modem = None;
         self.ctl = None;
@@ -774,10 +792,26 @@ impl Engine {
     }
 
     fn auto_leave_kiss(&mut self) {
-        if self.kiss && !self.monitor && self.bridge_listener.is_none() && !self.session_active() {
-            self.leave_kiss();
-            self.say("radio back to normal operation");
+        if !(self.kiss && !self.monitor && self.bridge_listener.is_none() && !self.session_active()) {
+            self.leave_kiss_pending = false;
+            return;
         }
+        if !self.tnc_drained() {
+            self.leave_kiss_pending = true; // checked again from the main loop
+            return;
+        }
+        self.leave_kiss_pending = false;
+        self.leave_kiss();
+        self.say("radio back to normal operation");
+    }
+
+    /// True once the TNC has had time to send our last frame: leaving packet mode earlier strands it in
+    /// the TNC's buffer (the radio shows STA). A busy channel delays sending, so it must also be quiet.
+    fn tnc_drained(&self) -> bool {
+        let quiet = |t: Option<Instant>, d: Duration| t.is_none_or(|t| t.elapsed() >= d);
+        // the longest wait is bounded: after 20 s the frame is not coming out
+        quiet(self.last_tx, Duration::from_secs(20))
+            || (quiet(self.last_tx, TNC_DRAIN) && quiet(self.last_rx, CHANNEL_QUIET))
     }
 
     fn set_speed(&mut self, baud: u32) {
@@ -903,7 +937,11 @@ impl Engine {
             }
         };
         let now = Instant::now();
-        for f in self.decoder.feed(&data) {
+        let frames = self.decoder.feed(&data);
+        if !frames.is_empty() {
+            self.last_rx = Some(now);
+        }
+        for f in frames {
             if f.is_empty() || f[0] & 0x0F != kiss::cmd::DATA {
                 continue;
             }
