@@ -16,6 +16,7 @@ use ratatui::Frame;
 use crate::config::{self, Bbs, RadioProfile};
 use crate::devices::{self, Device, LastScan};
 use crate::discover::{self, Discovery};
+use crate::dstar;
 use crate::engine::{self, Handle, Job, Out, Packet, Snapshot, Target};
 use crate::gateways;
 use crate::link::Link;
@@ -65,8 +66,22 @@ While connected, / lines that are not term73 commands (like /EX) go to the stati
 /advanced kiss on|off         switch the radio's TNC by hand
 /advanced modem status        software modem state (control port)
 /advanced modem set key=value ...
-/advanced rigctl start [port] | stop   Hamlib-compatible rig control on 127.0.0.1 (default 4532) for modem73, WSJT-X, Gpredict"),
+/advanced rigctl start [port] | stop   Hamlib-compatible rig control on 127.0.0.1 (default 4532) for modem73, WSJT-X, Gpredict
+/advanced dv                  D-STAR data probe: watch and send test data in DV Data Mode (/advanced dv lists its commands)"),
 ];
+
+const DV_HELP: &str = "[ D-STAR DATA PROBE ]  find out how the radio carries DV data; nothing here changes radio settings
+On the radio (TH-D75 menu numbers): DV mode, then F, MODE, Data Mode (DATA icon). Menu 984 picks USB or Bluetooth
+for the data; menu 614 Data TX End Timing must be 0.5 s or more (Off never transmits); menus 630 and 611 off.
+/advanced dv monitor on            show in hex what the radio sends unasked on the rig-control link
+/advanced dv monitor on <port>     the same for a separate data port (serial device or Bluetooth address)
+/advanced dv monitor off
+/advanced dv send <text>           send a line (CR added); lines must not start with two letters or digits
+/advanced dv sendhex <hex>         send exact bytes, e.g. 24 24 0d
+/advanced dv sweep                 send every byte value 00-ff; a receiving term73 lists what did not arrive
+/advanced dv burst <bytes>         send numbered 32-byte lines; a receiving term73 lists missing lines
+/advanced dv rate <bytes/s> | off  pace the writes (off: everything at once)
+Sending transmits: /transmit on first, low power or a dummy load while testing.";
 const BASIC: &[&str] = &["basics", "bbs", "winlink", "radio", "settings"];
 
 const COMMANDS: &[(&str, &[&str])] = &[
@@ -74,9 +89,19 @@ const COMMANDS: &[(&str, &[&str])] = &[
     ("/power", &["high", "mid", "low"]), ("/transmit", &["on", "off"]),
     ("/bbs", &["add", "edit", "list", "connect", "remove"]), ("/winlink", &["setup", "gateways", "start", "stop"]),
     ("/radio", &["scan", "list", "select", "setup", "info", "off"]), ("/config", &["show", "callsign", "grid"]),
-    ("/advanced", &["cat", "watch", "kiss", "modem", "rigctl"]),
+    ("/advanced", &["cat", "watch", "kiss", "modem", "rigctl", "dv"]),
     ("/help", &["basics", "bbs", "winlink", "radio", "settings", "advanced"]), ("/clear", &[]), ("/quit", &[]),
 ];
+
+/// The rest of `line` after its first `n` words.
+fn words_after(line: &str, n: usize) -> &str {
+    let mut rest = line.trim_start();
+    for _ in 0..n {
+        rest = rest.trim_start();
+        rest = &rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..];
+    }
+    rest.strip_prefix(' ').unwrap_or(rest)
+}
 
 /// In a session, the text a "/" line sends to the station, or None when it is a term73 command.
 fn slash_to_station(line: &str) -> Option<String> {
@@ -1025,6 +1050,7 @@ impl App {
                 }
                 ("rigctl", Some("start")) => e.send(Job::RigctlStart(rest.get(1).and_then(|p| p.parse().ok()).unwrap_or(4532))),
                 ("rigctl", Some("stop")) => e.send(Job::RigctlStop),
+                ("dv", _) => self.dv_command(line, &rest)?,
                 _ => {
                     let text = format!("[ ADVANCED ]\n{}", HELP[5].1);
                     self.push(&text);
@@ -1033,6 +1059,43 @@ impl App {
             other => self.push(&format!("unknown command {other}; /help lists them")),
         }
         let _ = &self.out_tx;
+        Ok(())
+    }
+
+    /// /advanced dv: the D-STAR data probe.
+    fn dv_command(&mut self, line: &str, args: &[&str]) -> Result<(), String> {
+        let e = &self.engine;
+        let arg = |i: usize| args.get(i).map(|s| s.to_ascii_lowercase());
+        match arg(0).as_deref() {
+            Some("monitor") => match arg(1).as_deref() {
+                Some("on") => e.send(Job::DvMonitorOn(args.get(2).map(|p| p.to_string()))),
+                Some("off") => e.send(Job::DvMonitorOff),
+                _ => return Err("/advanced dv monitor on [port] | off".into()),
+            },
+            Some("send") => {
+                let text = words_after(line, 3);
+                if text.is_empty() {
+                    return Err("/advanced dv send <text>".into());
+                }
+                let mut data = text.as_bytes().to_vec();
+                data.push(b'\r');
+                e.send(Job::DvSend(data, "a text line".into()));
+            }
+            Some("sendhex") => e.send(Job::DvSend(dstar::parse_hex(&args[1..].join(" "))?, "hex bytes".into())),
+            Some("sweep") => e.send(Job::DvSend(dstar::sweep_payload(), "every byte value 00-ff".into())),
+            Some("burst") => {
+                let n: usize = args.get(1).and_then(|n| n.parse().ok()).filter(|n| (1..=dstar::MAX_SEND).contains(n))
+                    .ok_or(format!("/advanced dv burst <bytes>, 1 to {}", dstar::MAX_SEND))?;
+                let data = dstar::burst_payload(n);
+                e.send(Job::DvSend(data.clone(), format!("{} numbered lines", data.len() / dstar::BURST_LINE)));
+            }
+            Some("rate") => e.send(Job::DvRate(match arg(1).as_deref() {
+                Some("off") => None,
+                n => Some(n.and_then(|n| n.parse::<u32>().ok()).filter(|&r| r > 0)
+                    .ok_or("/advanced dv rate <bytes per second> | off")?),
+            })),
+            _ => self.push(DV_HELP),
+        }
         Ok(())
     }
 
@@ -1152,6 +1215,7 @@ impl App {
         // rig state only; sessions, listening and Winlink belong to the Stations/Session panel
         let tnc = match (s.software_modem, s.packet) {
             (true, _) => "software modem",
+            (false, Packet::Idle) if s.dv_probe.is_some() => "D-STAR data probe",
             (false, Packet::Idle) => "command mode",
             (false, _) => "packet (KISS)",
         };
@@ -1160,7 +1224,7 @@ impl App {
             Self::row(t, "address", s.address.clone().unwrap_or_default(), t.value),
             Self::row(t, "profile", if s.profile_saved { "saved".into() } else { "none".into() }, if s.profile_saved { t.value } else { t.warnv }),
             Self::row(t, "frequency", s.freq_mhz.map(|f| format!("{f:.3} MHz")).unwrap_or("?".into()), t.value),
-            Self::row(t, "TNC", tnc.into(), if s.packet == Packet::Idle { t.value } else { t.good }),
+            Self::row(t, "TNC", tnc.into(), if s.packet == Packet::Idle && s.dv_probe.is_none() { t.value } else { t.good }),
             Self::row(t, "PTT band", s.bands.map(|(_, p)| engine::band_name(p).to_string()).unwrap_or_else(|| "?".into()), t.value),
             Self::row(t, "transmit", if s.transmit_allowed { "ALLOWED".into() } else { "off".into() }, if s.transmit_allowed { t.tx } else { t.value }),
         ]
@@ -1287,6 +1351,20 @@ mod remote_text_tests {
         a.push("*** disconnected");
         a.push_remote("new line");
         assert_eq!(a.main.last().unwrap(), "new line", "our own lines close an open remote line");
+        a.shutdown();
+    }
+
+    #[test]
+    fn dv_probe_commands() {
+        assert_eq!(words_after("/advanced dv send #a  b", 3), "#a  b");
+        assert_eq!(words_after("/advanced dv send", 3), "");
+        let mut a = app();
+        a.command("/advanced dv").unwrap();
+        assert!(a.main.iter().any(|l| l.starts_with("[ D-STAR DATA PROBE ]")));
+        for bad in ["/advanced dv send", "/advanced dv burst 0", "/advanced dv burst 5000", "/advanced dv sendhex 2",
+                    "/advanced dv rate fast", "/advanced dv monitor"] {
+            assert!(a.command(bad).is_err(), "{bad}");
+        }
         a.shutdown();
     }
 }

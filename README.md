@@ -92,6 +92,14 @@ modem73 is found by `/radio scan` when it is running (control port 8073, KISS po
 
 `/advanced rigctl start` runs a server on `127.0.0.1:4532` that speaks Hamlib's rigctld protocol. Programs that support "Hamlib NET rigctl" (for example WSJT-X, Gpredict or fldigi) can then read and set the frequency, read the mode and band, set the power (high, mid, low) and read the busy signal through term73, including for radios Hamlib itself does not support, such as the TM-D750. Transmit (PTT) is only offered once keying has been verified for the radio and `/transmit on` is set. Anything not yet confirmed for the radio answers "not available".
 
+## D-STAR data (testing)
+
+term73 does not send D-STAR data yet. `/advanced dv` is a probe for finding out how a radio carries DV Fast Data on its link before that is built. On the TH-D75, Data Mode is switched on at the radio (F, MODE, Data Mode); menu 984 picks USB or Bluetooth for the data, and menu 614 Data TX End Timing must be 0.5 s or more for the radio to transmit.
+
+- `/advanced dv monitor on [port]` shows in hex what arrives on the rig-control link, or on a separate data port, and sums up each reception.
+- `/advanced dv send`, `sendhex`, `sweep` and `burst` transmit test data. A term73 monitoring at the other end reports which byte values, or which numbered lines, did not arrive. `/advanced dv rate` paces the writes.
+- Sending needs `/transmit on`. Data with a line that starts with two letters or digits is refused, so nothing sent can be taken as a rig command such as `TX`.
+
 ## Configuration
 
 - Windows: `%APPDATA%\term73`
