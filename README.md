@@ -100,6 +100,8 @@ term73 does not send D-STAR data yet. `/advanced dv` is a probe for finding out 
 - `/advanced dv send`, `sendhex`, `sweep` and `burst` transmit test data. A term73 monitoring at the other end reports which byte values, or which numbered lines, did not arrive. `/advanced dv rate` paces the writes.
 - Sending needs `/transmit on`. Data with a line that starts with two letters or digits is refused, so nothing sent can be taken as a rig command such as `TX`.
 
+The full test procedure, with the radio settings, is in [docs/dstar-probe-tests.md](docs/dstar-probe-tests.md).
+
 ## Configuration
 
 - Windows: `%APPDATA%\term73`
