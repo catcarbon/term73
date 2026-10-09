@@ -751,3 +751,46 @@ fn dv_probe_on_a_separate_data_port() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A radio in DV Data Mode answers no rig commands on its data link: connecting stops after ID gets no
+/// reply, so nothing more is sent that the radio might transmit, and the data probe can still watch the link.
+#[test]
+fn silent_radio_gets_no_more_rig_commands() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("silent");
+    {
+        let mut r = rig.radio.lock().unwrap();
+        r.cat_silent = true;
+        r.dv_air = Some(Vec::new());
+    }
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("the radio does not answer rig commands (ID)", None);
+    let sent = String::from_utf8_lossy(rig.radio.lock().unwrap().dv_air.as_deref().unwrap()).into_owned();
+    assert!(sent.ends_with("ID\r"), "ID was the last rig command: {sent:?}");
+    assert!(!sent.contains("TN") && !sent.contains("FQ") && !sent.contains("BC"), "{sent:?}");
+    let (model, _) = rig.h().ask(Job::CurrentProfile, Duration::from_secs(10)).unwrap();
+    assert_eq!(model, None);
+
+    // every path that would send a rig command is refused, and nothing more reaches the radio
+    let before = rig.radio.lock().unwrap().dv_air.clone();
+    rig.h().send(Job::SetTransmit(true));
+    for job in [Job::Cat("ID".into()), Job::Watch(Some("FO 1".into())), Job::Ident, Job::Tune(145.09), Job::Power(2),
+                Job::KissOn, Job::Listen(true, None)] {
+        rig.h().send(job);
+    }
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Ptt(false, tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(true), "unkeying needs no rig command here");
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Rig(term73::rigctld::Req::SetMode("AM".into()), tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Err(term73::rigctld::ERJCTED), "no mode change");
+    rig.h().ask(Job::Discover, Duration::from_secs(10)).expect_err("no capability probing");
+    rig.pump();
+    assert_eq!(rig.text.matches("did not answer rig commands when connected").count(), 7, "{}", rig.text);
+    assert_eq!(rig.radio.lock().unwrap().dv_air, before, "nothing more was sent");
+
+    rig.h().send(Job::DvMonitorOn(None));
+    rig.wait_for("D-STAR data monitor on the rig-control link", None);
+    rig.radio.lock().unwrap().to_host.extend(b"#hello\r");
+    rig.wait_for("dv rx 0000  23 68 65 6c 6c 6f 0d", None);
+}

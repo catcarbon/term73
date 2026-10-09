@@ -370,6 +370,9 @@ fn select_flow(c: &Ctx, n: usize) -> Result<(), Cancelled> {
             return Ok(());
         }
     };
+    if model.is_none() {
+        return Ok(()); // the radio did not answer: no profile questions or capability probing now
+    }
     if !config::load_radios().contains_key(&d.target.key()) && prof == RadioProfile::default() {
         if reuse_profile(c, model.or_else(|| d.model.clone()))? {
             return Ok(());
@@ -1359,6 +1362,9 @@ impl App {
     fn rig_lines(&self, t: &Theme) -> Vec<Line<'static>> {
         let s = &self.snap;
         let Some(model) = s.model.clone() else {
+            if let Some(addr) = s.address.clone() {
+                return vec![Self::row(t, "rig", "not answering".into(), t.warnv), Self::row(t, "address", addr, t.value)];
+            }
             return vec![Self::row(t, "rig", "none".into(), t.value), Line::from(Span::styled(" /radio scan to find one", t.dim))];
         };
         // rig state only; sessions, listening and Winlink belong to the Stations/Session panel

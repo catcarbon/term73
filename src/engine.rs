@@ -311,12 +311,19 @@ struct Engine {
     memory_restore: Option<gateways::MemorySpot>,
     dv: Option<DvProbe>,
     dv_rate: Option<u32>,
+    /// The radio did not answer ID when connected: no rig commands are sent until it is selected again.
+    silent: bool,
     running: bool,
 }
 
 /// APRS channels; term73 will not start a connected session on them.
 /// 144.390 North America, 144.800 Europe and Africa, 145.175 Australia, 145.825 the ISS digipeater.
 const APRS_MHZ: &[f64] = &[144.390, 144.800, 145.175, 145.825];
+
+/// Why rig commands are refused for a radio that did not answer when connected.
+const SILENT: &str = "the radio did not answer rig commands when connected. In DV Data Mode the link menu 984 points \
+                      at transmits whatever it gets, rig commands included, so term73 sends none. Turn Data Mode off \
+                      (or point menu 984 at the other interface), then /radio select again";
 
 /// Read BC: the TM-D750 answers "BC ctrl,ptt"; radios with one value use it for both. 0 = A, 1 = B.
 fn read_bands(link: &mut dyn Link) -> Option<(u8, u8)> {
@@ -356,7 +363,7 @@ impl Engine {
             monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, bands: None, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
             ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, memory_restore: None,
-            dv: None, dv_rate: None, running: true,
+            dv: None, dv_rate: None, silent: false, running: true,
         };
         e.publish();
         e
@@ -664,6 +671,9 @@ impl Engine {
         if self.radio.is_none() && self.modem.is_none() {
             return Err("no rig: /radio scan, then /radio select <n>".into());
         }
+        if self.silent {
+            return Err(SILENT.into());
+        }
         Ok(())
     }
 
@@ -675,6 +685,9 @@ impl Engine {
         }
         if self.kiss {
             return Err("the radio is busy with packet (connection or listening): end that first".into());
+        }
+        if self.silent {
+            return Err(SILENT.into());
         }
         Ok(())
     }
@@ -736,6 +749,17 @@ impl Engine {
         cat::kiss_off(r);
         self.kiss = false;
         self.model = gateways::radio_model(r);
+        if self.model.is_none() {
+            // In DV Data Mode the link menu 984 points at answers no rig commands and transmits what it gets
+            // (seen on a TH-D75), so send nothing more until the radio is selected again.
+            self.band = self.prof.data_band.unwrap_or(1);
+            self.silent = true;
+            self.say("the radio does not answer rig commands (ID). If it is in DV Data Mode with menu 984 on this \
+                      link, it transmits them as data: term73 sends no more rig commands to it. Turn Data Mode off \
+                      (or point menu 984 at the other interface), then /radio select again. /advanced dv monitor on \
+                      watches the data");
+            return Ok(());
+        }
         let tn = cat::cat(r, "TN", Duration::from_secs(2), false).unwrap_or_default();
         self.band = self.prof.data_band.unwrap_or_else(|| tn.split(',').nth(1).and_then(|b| b.parse().ok()).unwrap_or(1));
         self.bands = read_bands(r);
@@ -769,6 +793,7 @@ impl Engine {
         self.leave_kiss_pending = false;
         self.put_memory_back();
         self.dv = None;
+        self.silent = false;
         self.radio = None;
         self.modem = None;
         self.ctl = None;
@@ -847,6 +872,9 @@ impl Engine {
         }
         if self.dv.is_some() {
             return Err("the D-STAR data monitor is on: /advanced dv monitor off first".into());
+        }
+        if self.silent {
+            return Err(SILENT.into());
         }
         let band = self.band;
         let r = cat::cat(self.radio.as_deref_mut().ok_or("no radio")?, &format!("TN 2,{band}"), Duration::from_secs(2), false)
@@ -1312,7 +1340,7 @@ impl Engine {
         if self.radio.is_none() && self.modem.is_none() {
             return Err(ENAVAIL);
         }
-        let cat_ok = self.radio.is_some() && !self.kiss;
+        let cat_ok = self.radio.is_some() && !self.kiss && !self.silent;
         match r {
             Req::GetFreq if cat_ok => self.freq_hz().map(Resp::Freq).map_err(|_| ENAVAIL),
             Req::GetFreq => self.freq.map(|f| Resp::Freq((f * 1e6).round() as u64)).ok_or(ENAVAIL),
@@ -1342,6 +1370,9 @@ impl Engine {
                 let code = rigctld::kenwood_mode_code(&name).ok_or(ENAVAIL)?;
                 if self.modem.is_some() || self.radio.is_none() {
                     return Err(ENAVAIL);
+                }
+                if self.silent {
+                    return Err(ERJCTED);
                 }
                 if self.session_active() || self.kiss {
                     return Err(ERJCTED); // packet mode needs FM; do not change it under a session or /listen
@@ -1435,7 +1466,7 @@ impl Engine {
 
     fn ptt(&mut self, on: bool) -> Result<bool, String> {
         if !on {
-            if !self.kiss
+            if !self.kiss && !self.silent
                 && let Some(r) = self.radio.as_deref_mut() {
                     let _ = cat::cat(r, "RX", Duration::from_secs(2), true);
                 }
@@ -1654,7 +1685,7 @@ impl Engine {
         }
         w.next = Instant::now() + Duration::from_secs(2);
         let cmd = w.cmd.clone();
-        if self.kiss || self.radio.is_none() {
+        if self.kiss || self.radio.is_none() || self.silent {
             self.watch = None;
             self.say("watch stopped: rig control is no longer available");
             return;

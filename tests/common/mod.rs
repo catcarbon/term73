@@ -36,6 +36,8 @@ pub struct Radio {
     /// In DV Data Mode: every byte written outside KISS, as the radio would transmit it. Rig commands are
     /// still answered too (how a real radio sorts them is not known yet).
     pub dv_air: Option<Vec<u8>>,
+    /// Answers no rig commands at all, as the TH-D75 does on its data link in DV Data Mode.
+    pub cat_silent: bool,
     pub decoder: kiss::Decoder,
     pub cat_buf: Vec<u8>,
 }
@@ -135,6 +137,9 @@ impl Link for FakeLink {
         }
         if let Some(air) = r.dv_air.as_mut() {
             air.extend_from_slice(data);
+        }
+        if r.cat_silent {
+            return Ok(());
         }
         r.cat_buf.extend_from_slice(data);
         while let Some(p) = r.cat_buf.iter().position(|&b| b == b'\r') {

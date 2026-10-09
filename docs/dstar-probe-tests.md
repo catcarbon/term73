@@ -54,7 +54,7 @@ One term73 can run both stations. Station A is the radio you select as usual. St
 
 ## Start term73
 
-**Connect before turning Data Mode on.** term73 sends rig commands as it connects (ID, TN, BC, FQ...). Until test 1 shows whether the radio transmits those in Data Mode, keep Data Mode off while connecting.
+**Connect before turning Data Mode on.** term73 sends rig commands as it connects (ID, TN, BC, FQ...), and a TH-D75 in Data Mode transmits them as data when menu 984 points at that link (seen in testing). If the radio does not answer when term73 connects, term73 stops after `ID` and sends no more rig commands to it. Turn Data Mode off, then select the radio again.
 
 Station A:
 
@@ -87,21 +87,16 @@ This shows what the radio does with data bytes when it is not in Data Mode.
 2. A: `/transmit on`, then `/advanced dv send #hello`.
 3. Expected: A does not transmit, and A's monitor shows `3f 0d` (`?.`). That is the radio answering `#hello` as an unknown command. Note what you actually see.
 
-## Test 1: rig commands in Data Mode, same link
+## Test 1: data on the same link as rig control
 
-This is the safety question: does the radio transmit rig commands when data and rig control share a link?
+Already seen on the TH-D75: with Data Mode on and menu 984 pointing at term73's link, the radio answers no rig commands (`(no reply)`, "unknown radio") and transmits them as data. So don't send rig commands (`/advanced cat`, `/frequency`, `/listen`...) to a radio in Data Mode on that link. Run anything that needs rig commands with menu 984 set to USB (tests 2 and 3).
 
-1. A: Data Mode on. Menu 984 = Bluetooth.
-2. A: `/advanced cat ID`, then check:
-   - Does term73 show `ID -> ID TH-D75`, or `(no reply)`?
-   - Does A transmit (TX indicator)?
-   - Does B receive `49 44 0d` (`ID.`)?
-3. Repeat with `/advanced cat FV`.
-4. A: `/advanced dv send #hello`, then check:
+What is left to check is the data itself:
+
+1. A: connect with Data Mode off, then turn Data Mode on. Menu 984 = Bluetooth.
+2. A: `/advanced dv send #hello`, then check:
    - Does A transmit, and does B receive `#hello`?
-   - Does A's own monitor then show `3f 0d` (`?.`)? That would mean the radio also read the line as a command.
-
-If A transmitted on `ID` or `FV`, every rig command term73 sends on this link goes on air. From here on, run anything that needs rig commands with menu 984 set to USB (tests 2 and 3).
+   - Does anything come back on A's monitor?
 
 On macOS: MacRats found that DV data did not flow through `/dev/cu.TH-D75`. If test 1 shows nothing at all on a Mac, that may be why; try test 3 (USB).
 
@@ -180,7 +175,7 @@ These commands only read.
 | Test | Record |
 |---|---|
 | 0 | Did A transmit? A's monitor dump |
-| 1 | `ID` and `FV` replies; did A transmit; did B receive them; did `?.` appear at A after the send |
+| 1 | Did A transmit `#hello`; did B receive it; did anything come back on A's monitor |
 | 2 | The reply; did A transmit; did B receive anything |
 | 3 | Port name; did A to B work; did B to A show on USB; did Bluetooth still answer `ID` |
 | 4 | A's dump for each menu 618 setting |
