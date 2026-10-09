@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -28,8 +29,10 @@ pub(crate) fn load<T: DeserializeOwned + Default>(name: &str) -> T {
 }
 
 pub(crate) fn save<T: Serialize>(name: &str, value: &T) -> io::Result<()> {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     fs::create_dir_all(home())?;
-    let tmp = path(&format!("{name}.tmp"));
+    // a temporary file of its own, so two engines saving at once cannot cut each other's file short
+    let tmp = path(&format!("{name}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
     fs::write(&tmp, serde_json::to_string_pretty(value)?)?;
     fs::rename(tmp, path(name))
 }

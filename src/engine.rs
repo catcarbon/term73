@@ -516,8 +516,11 @@ impl Engine {
                 if !config::valid_call(&call) {
                     return Err(format!("{call:?} does not look like a callsign"));
                 }
-                self.cfg.callsign = Some(call.to_ascii_uppercase());
-                self.cfg.save().map_err(|e| e.to_string())?;
+                // from the file, not this engine's copy: another engine or a wizard may have saved since
+                let mut cfg = AppConfig::load();
+                cfg.callsign = Some(call.to_ascii_uppercase());
+                cfg.save().map_err(|e| e.to_string())?;
+                self.cfg = cfg;
                 self.say(format!("callsign {} saved", call.to_ascii_uppercase()));
             }
             Job::SetGrid(grid) => {
@@ -525,8 +528,10 @@ impl Engine {
                     return Err(format!("{grid:?} is not a grid locator"));
                 }
                 let g = format!("{}{}", grid[..4].to_ascii_uppercase(), grid[4..].to_ascii_lowercase());
-                self.cfg.grid = Some(g.clone());
-                self.cfg.save().map_err(|e| e.to_string())?;
+                let mut cfg = AppConfig::load();
+                cfg.grid = Some(g.clone());
+                cfg.save().map_err(|e| e.to_string())?;
+                self.cfg = cfg;
                 self.say(format!("grid {g} saved"));
             }
             Job::Connect(call, path) => {
@@ -715,6 +720,7 @@ impl Engine {
             self.ctl = Some(ctl);
             self.model = Some("MODEM73".into());
             self.target = Some(t.clone());
+            self.publish();
             self.decoder = kiss::Decoder::new();
             self.say(format!("rig: modem73 at {} ({} {}, payload {} B); wire log {}", t.address(),
                              cfgv.get("modulation").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -724,6 +730,7 @@ impl Engine {
         }
         self.radio = Some(link);
         self.target = Some(t.clone());
+        self.publish(); // a second radio must see this device is taken before identification finishes
         self.say(format!("radio connected ({}); wire log {}", t.address(), log_path.display()));
         let r = self.radio.as_deref_mut().unwrap();
         cat::kiss_off(r);

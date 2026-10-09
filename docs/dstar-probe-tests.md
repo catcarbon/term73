@@ -8,7 +8,7 @@ Menu numbers are the TH-D75's. Before changing a setting, check that the name on
 
 - **Station A:** the TH-D75 under test. Connect it to term73 over Bluetooth, and also by USB cable to the same computer (for test 3).
 - **Station B:** a second D-STAR radio that does Fast Data, where you can see what it receives. Either:
-  - the TM-D750 with a second term73, if it has Data Mode (see [Station B settings](#station-b-settings)), or
+  - the TM-D750, if it has Data Mode (see [Station B settings](#station-b-settings)), as radio B in the same term73, or
   - an Icom radio with Fast Data (ID-52, ID-50, IC-705, IC-9700, ...) and a serial terminal program that shows hex (picocom, CoolTerm, RealTerm). Don't select an Icom in term73: term73 sends Kenwood rig commands when it connects, and an Icom in DV Data mode would transmit them.
 - **A simplex frequency** where your band plan allows digital data, away from repeaters and APRS.
 - **Low power**, and a dummy load on A if you have one. A few metres between the radios is plenty.
@@ -23,10 +23,7 @@ git checkout claude/elegant-euler-827lu1
 cargo run --release
 ```
 
-To run a second term73 for station B on the same computer, give it its own config folder:
-
-- Linux or macOS: `TERM73_HOME=~/term73-b cargo run --release`
-- Windows PowerShell: `$env:TERM73_HOME="$HOME\term73-b"; cargo run --release`
+One term73 can run both stations. Station A is the radio you select as usual. Station B is a second radio: put `/b` in front of a command to run it on B, and B's lines start with `[B]`. In the tests, "B: `/advanced dv sweep`" means typing `/b /advanced dv sweep`. Each radio has its own transmit permission, so B needs its own `/b /transmit on`.
 
 ## Station A settings (TH-D75)
 
@@ -67,16 +64,18 @@ Station A:
 /advanced dv monitor on
 ```
 
-Station B, if it is the TM-D750 with term73:
+Station B, if it is the TM-D750 as radio B:
 
 ```
-/radio select <n>
-/advanced dv monitor on              or: /advanced dv monitor on <port>, if its data goes to another port
+/b /radio select <n>
+/b /advanced dv monitor on           or: /b /advanced dv monitor on <port>, if its data goes to another port
 ```
+
+term73 will not let both radios open the same device. If B's profile was saved under another address, `/radio select` offers it.
 
 Now turn Data Mode on at both radios.
 
-**Wire logs.** Every byte also goes into a wire log in term73's `logs` folder: Linux `~/.config/term73/logs`, macOS `~/Library/Application Support/term73/logs`, Windows `%APPDATA%\term73\logs`. A separate data port gets its own file, whose name starts with `dv_`.
+**Wire logs.** Every byte also goes into a wire log in term73's `logs` folder: Linux `~/.config/term73/logs`, macOS `~/Library/Application Support/term73/logs`, Windows `%APPDATA%\term73\logs`. A separate data port gets its own file, whose name starts with `dv_`. Each radio has its own log.
 
 **If a radio stays keyed:** run `/advanced dv monitor off`, which drops anything term73 has not sent yet. If the radio still transmits, turn Data Mode off or switch the radio off.
 

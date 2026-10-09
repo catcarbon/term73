@@ -53,7 +53,9 @@ pub const HELP: &[(&str, &str)] = &[
 /radio select <n>             use device <n> from the last scan
 /radio setup                  detect capabilities and review the profile
 /radio info                   model, firmware, frequency, power
-/radio off                    disconnect"),
+/radio off                    disconnect
+/b <command>                  run a command on a second radio (B) for testing, e.g. /b /radio select 2;
+                              its lines start with [B]. Sessions and Winlink stay on the first radio"),
     ("settings", "/config show
 /config callsign <CALL>
 /config grid <LOCATOR>
@@ -114,7 +116,7 @@ fn slash_to_station(line: &str) -> Option<String> {
 /// True when the first word of a "/" line names a term73 command.
 fn is_own_command(line: &str) -> bool {
     let word = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-    word == "/tx" || COMMANDS.iter().any(|(c, _)| *c == word)
+    word == "/tx" || word == "/b" || COMMANDS.iter().any(|(c, _)| *c == word)
 }
 
 // ------------------------------------------------------------------ theme
@@ -255,6 +257,8 @@ struct Ctx {
     asks: Sender<Ask>,
     jobs: Sender<Job>,
     scan: Arc<Mutex<Vec<Device>>>,
+    /// The other radio's state (A for B, B for A): the device it uses must not be opened twice.
+    other: Option<Arc<Mutex<Snapshot>>>,
 }
 
 struct Cancelled;
@@ -353,8 +357,13 @@ fn select_flow(c: &Ctx, n: usize) -> Result<(), Cancelled> {
         c.say(if devs.is_empty() { "error: scan first: /radio scan".into() } else { format!("error: pick 1 to {}", devs.len()) });
         return Ok(());
     };
+    let taken = c.other.as_ref().and_then(|o| o.lock().unwrap().address.clone());
+    if taken.is_some_and(|o| o.eq_ignore_ascii_case(&d.target.address())) {
+        c.say(format!("error: the other radio is using {}", d.target.address()));
+        return Ok(());
+    }
     let _ = c.jobs.send(Job::Open(d.target.clone()));
-    let (_, prof) = match c.call(Job::CurrentProfile) {
+    let (model, prof) = match c.call(Job::CurrentProfile) {
         Ok(p) => p,
         Err(e) => {
             c.say(format!("error: {e}"));
@@ -362,10 +371,41 @@ fn select_flow(c: &Ctx, n: usize) -> Result<(), Cancelled> {
         }
     };
     if !config::load_radios().contains_key(&d.target.key()) && prof == RadioProfile::default() {
+        if reuse_profile(c, model.or_else(|| d.model.clone()))? {
+            return Ok(());
+        }
         c.say("no profile for this rig yet; setting one up");
         setup_flow(c)?;
     }
     Ok(())
+}
+
+/// A device without a profile may be a saved radio at a new address (another COM number or rfcomm
+/// device, or its Bluetooth address instead of its serial port): offer the saved profiles of the same
+/// model. True when one was taken.
+fn reuse_profile(c: &Ctx, model: Option<String>) -> Result<bool, Cancelled> {
+    let saved: Vec<(String, RadioProfile)> = config::load_radios().into_iter()
+        .filter(|(_, p)| model.is_none() || p.model == model)
+        .collect();
+    if saved.is_empty() {
+        return Ok(false);
+    }
+    c.say(format!("saved profiles{}:", model.as_deref().map(|m| format!(" for {m}")).unwrap_or_default()));
+    for (i, (key, p)) in saved.iter().enumerate() {
+        let band = p.data_band.map(|b| format!(", data band {}", engine::band_name(b))).unwrap_or_default();
+        c.say(format!("  {}  {} {}{band}", i + 1, p.model.as_deref().unwrap_or("rig"), p.address.as_deref().unwrap_or(key)));
+    }
+    let ans = c.ask("Use one of these for this device? Its number, or Enter to set up a new profile", Some(""), false)?;
+    let Some((_, p)) = ans.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| saved.get(i)) else {
+        return Ok(false);
+    };
+    match c.call(|tx| Job::SaveProfile(p.clone(), tx)) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            c.say(format!("error: {e}"));
+            Ok(false)
+        }
+    }
 }
 
 fn show<T: serde::Serialize>(v: &Option<T>) -> String {
@@ -585,6 +625,18 @@ pub struct App {
     popup: Option<popup::Popup>,
     /// F8 hides the side panels (rig, stations or session).
     side_hidden: bool,
+    /// Radio B: a second rig for testing, started by the first /b line.
+    second: Option<Second>,
+    /// Set while a /b line runs: commands and wizards go to radio B.
+    to_b: bool,
+}
+
+/// A second radio engine, so two stations can be tested from one window.
+struct Second {
+    engine: Handle,
+    out_rx: Receiver<Out>,
+    out_tx: Sender<Out>,
+    snap: Snapshot,
 }
 
 impl App {
@@ -593,11 +645,12 @@ impl App {
         let (out_tx, out_rx) = mpsc::channel();
         let engine = engine::spawn(out_tx.clone(), opener_for_engine);
         let (ask_tx, ask_rx) = mpsc::channel();
-        let ctx = Ctx { out: out_tx.clone(), asks: ask_tx, jobs: engine.jobs.clone(), scan: Arc::new(Mutex::new(LastScan::load().devices)) };
+        let ctx = Ctx { out: out_tx.clone(), asks: ask_tx, jobs: engine.jobs.clone(), scan: Arc::new(Mutex::new(LastScan::load().devices)), other: None };
         let mut app = App {
             theme, engine, out_rx, out_tx, ask_rx, ctx, open, main: vec![WELCOME.into()], remote: vec![false], remote_open: false, traffic: Vec::new(),
             scroll: 0, input: String::new(), cursor: 0, history: Vec::new(), hist_pos: None, pending: None,
             busy: Arc::new(AtomicUsize::new(0)), last_ctrl_c: None, quit: false, snap: Snapshot::default(), menu: None, popup: None, side_hidden: false,
+            second: None, to_b: false,
         };
         if config::AppConfig::load().callsign.is_none() {
             app.wizard(first_run);
@@ -615,16 +668,67 @@ impl App {
     }
 
     pub fn shutdown(self) {
+        if let Some(b) = self.second {
+            b.engine.shutdown();
+        }
         self.engine.shutdown();
     }
 
     /// Shut down within a time budget (the window is closing): a station gets at most `wait` to acknowledge.
     pub fn shutdown_within(self, wait: Duration) {
+        if let Some(b) = self.second {
+            b.engine.shutdown_within(wait);
+        }
         self.engine.shutdown_within(wait);
     }
 
+    /// The engine commands go to: radio B while a /b line runs, otherwise radio A.
+    fn eng(&self) -> &Handle {
+        match &self.second {
+            Some(b) if self.to_b => &b.engine,
+            _ => &self.engine,
+        }
+    }
+
+    /// Every radio engine: settings that are not per radio go to all of them.
+    fn engines(&self) -> impl Iterator<Item = &Handle> {
+        std::iter::once(&self.engine).chain(self.second.as_ref().map(|b| &b.engine))
+    }
+
+    /// What a wizard started now works with: radio B's engine and output while a /b line runs.
+    fn ctx_now(&self) -> Ctx {
+        match &self.second {
+            Some(b) if self.to_b => Ctx { out: b.out_tx.clone(), jobs: b.engine.jobs.clone(), other: Some(self.engine.snap.clone()), ..self.ctx.clone() },
+            b => Ctx { other: b.as_ref().map(|b| b.engine.snap.clone()), ..self.ctx.clone() },
+        }
+    }
+
+    /// "/b <command>": run a term73 command on radio B, a second rig for testing.
+    fn second_command(&mut self, line: &str) -> Result<(), String> {
+        let cmd = words_after(line, 1).trim().to_string();
+        let words: Vec<String> = cmd.split_whitespace().take(2).map(|w| w.to_ascii_lowercase()).collect();
+        let (word, sub) = (words.first().map(String::as_str).unwrap_or(""), words.get(1).map(String::as_str).unwrap_or(""));
+        if !word.starts_with('/') || word == "/b" {
+            return Err("/b /<command>, e.g. /b /radio select 2 or /b /advanced dv monitor on".into());
+        }
+        if word == "/connect" || (word == "/bbs" && sub == "connect") || (word == "/winlink" && sub == "start") {
+            return Err("radio B is for testing: sessions and Winlink run on the first radio".into());
+        }
+        if self.second.is_none() {
+            let (out_tx, out_rx) = mpsc::channel();
+            let open = self.open.clone();
+            let engine = engine::spawn(out_tx.clone(), Box::new(move |t: &Target| open(t)));
+            self.push("radio B started: /b <command> runs a command on it; its lines start with [B]");
+            self.second = Some(Second { engine, out_rx, out_tx, snap: Snapshot::default() });
+        }
+        self.to_b = true;
+        let r = self.command(&cmd);
+        self.to_b = false;
+        r
+    }
+
     fn wizard(&mut self, f: impl FnOnce(&Ctx) -> Result<(), Cancelled> + Send + 'static) {
-        let ctx = self.ctx.clone();
+        let ctx = self.ctx_now();
         let busy = self.busy.clone();
         busy.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
@@ -688,6 +792,19 @@ impl App {
                 self.pending = Some(a);
             }
         self.snap = self.engine.snap.lock().unwrap().clone();
+        let from_b: Vec<Out> = match self.second.as_mut() {
+            Some(b) => {
+                b.snap = b.engine.snap.lock().unwrap().clone();
+                b.out_rx.try_iter().collect()
+            }
+            None => Vec::new(),
+        };
+        for o in from_b {
+            let (Out::Main(s) | Out::Traffic(s) | Out::Remote(s)) = o;
+            for l in s.trim_end_matches('\n').split('\n') {
+                self.push(&format!("[B] {l}"));
+            }
+        }
     }
 
     pub fn waiting_for_answer(&self) -> bool {
@@ -902,8 +1019,9 @@ impl App {
         let sub = words.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
         let rest: Vec<&str> = words.iter().skip(2).copied().collect();
         let arg = |i: usize| rest.get(i).copied().ok_or_else(|| format!("{} needs more arguments (/help)", words[0]));
-        let e = &self.engine;
+        let e = self.eng();
         match group.as_str() {
+            "/b" if !self.to_b => return self.second_command(line),
             "/help" => {
                 if let Some((_, text)) = HELP.iter().find(|(k, _)| *k == sub) {
                     let text = format!("[ {} ]\n{text}", sub.to_ascii_uppercase());
@@ -1018,8 +1136,14 @@ impl App {
                 _ => self.push(HELP[2].1),
             },
             "/config" => match sub.as_str() {
-                "callsign" => e.send(Job::SetCallsign(arg(0)?.to_string())),
-                "grid" => e.send(Job::SetGrid(arg(0)?.to_string())),
+                "callsign" => {
+                    let call = arg(0)?.to_string();
+                    self.engines().for_each(|e| e.send(Job::SetCallsign(call.clone())));
+                }
+                "grid" => {
+                    let grid = arg(0)?.to_string();
+                    self.engines().for_each(|e| e.send(Job::SetGrid(grid.clone())));
+                }
                 _ => {
                     let cfg = config::AppConfig::load();
                     let text = format!("[ CONFIG ]\n  config folder  {}\n  callsign       {}\n  grid           {}\n  Winlink key    {}\n  radio profiles {}, BBS profiles {}",
@@ -1064,7 +1188,7 @@ impl App {
 
     /// /advanced dv: the D-STAR data probe.
     fn dv_command(&mut self, line: &str, args: &[&str]) -> Result<(), String> {
-        let e = &self.engine;
+        let e = self.eng();
         let arg = |i: usize| args.get(i).map(|s| s.to_ascii_lowercase());
         match arg(0).as_deref() {
             Some("monitor") => match arg(1).as_deref() {
@@ -1127,7 +1251,7 @@ impl App {
         if wide {
             let side = Layout::default().direction(Direction::Vertical)
                 .constraints([Constraint::Length(8), Constraint::Min(4)]).split(cols[2]);
-            self.draw_panel(f, side[0], " RIG ", self.rig_lines(&t));
+            self.draw_panel(f, side[0], &self.rig_title().to_uppercase(), self.rig_lines(&t));
             let (title, lines) = self.station_panel(&t);
             self.draw_panel(f, side[1], &title.to_uppercase(), lines);
         }
@@ -1207,6 +1331,31 @@ impl App {
         Line::from(vec![Span::styled(format!(" {label:<10}"), t.label), Span::styled(value, style)])
     }
 
+    /// "Rig", or "Rig A" once a second radio is in use.
+    fn rig_title(&self) -> &'static str {
+        if self.second.is_some() { " Rig A " } else { " Rig " }
+    }
+
+    /// Radio B, the second rig for testing, at the top of the Stations panel.
+    fn radio_b_lines(t: &Theme, s: &Snapshot) -> Vec<Line<'static>> {
+        let Some(model) = s.model.clone() else {
+            return vec![Self::row(t, "radio B", "none".into(), t.value), Line::from(Span::styled(" /b /radio select <n>", t.dim))];
+        };
+        let state = match (s.transmitting, s.dv_probe.is_some(), s.packet) {
+            (true, _, _) => "transmitting",
+            (_, true, _) => "D-STAR data probe",
+            (_, _, Packet::Idle) => "command mode",
+            _ => "packet (KISS)",
+        };
+        vec![
+            Self::row(t, "radio B", model, t.value),
+            Self::row(t, "", s.address.clone().unwrap_or_default(), t.value),
+            Self::row(t, "", state.into(), if s.packet == Packet::Idle && s.dv_probe.is_none() { t.value } else { t.good }),
+            Self::row(t, "", format!("transmit {}", if s.transmit_allowed { "ALLOWED" } else { "off" }),
+                      if s.transmit_allowed { t.tx } else { t.value }),
+        ]
+    }
+
     fn rig_lines(&self, t: &Theme) -> Vec<Line<'static>> {
         let s = &self.snap;
         let Some(model) = s.model.clone() else {
@@ -1244,6 +1393,9 @@ impl App {
 
     fn stations_lines(&self, t: &Theme) -> Vec<Line<'static>> {
         let mut out = Vec::new();
+        if let Some(b) = &self.second {
+            out.extend(Self::radio_b_lines(t, &b.snap));
+        }
         if self.snap.listening {
             out.push(Line::from(Span::styled(" listening to the channel", t.good)));
         }

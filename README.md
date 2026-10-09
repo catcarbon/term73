@@ -67,7 +67,8 @@ Every command is also in the menu bar: press F10, or Alt with the highlighted le
 | `/transmit on\|off` | Permission to transmit. |
 | `/bbs add\|edit <name>\|list\|connect <name>\|remove <name>` | Saved BBSes: callsign, frequency, digipeaters, speed. |
 | `/winlink setup\|gateways\|start\|stop` | Gateway list, nearby gateways, and the Winlink client connection. |
-| `/radio scan [all]\|list [all]\|select <n>\|setup\|info\|off` | Find, choose and profile a rig. The last scan is kept across restarts. |
+| `/radio scan [all]\|list [all]\|select <n>\|setup\|info\|off` | Find, choose and profile a rig. The last scan is kept across restarts. A radio found at a new address (another COM number, say) can take its saved profile. |
+| `/b <command>` | Run a command on a second radio, B, for testing two stations from one window, e.g. `/b /radio select 2`. Its lines start with `[B]`. Sessions and Winlink stay on the first radio. |
 | `/config show\|callsign <CALL>\|grid <LOCATOR>` | Settings. |
 
 term73 switches the radio's TNC in and out of packet mode by itself. You do not need to know about KISS or rig-control commands unless you want to.
@@ -100,7 +101,7 @@ term73 does not send D-STAR data yet. `/advanced dv` is a probe for finding out 
 - `/advanced dv send`, `sendhex`, `sweep` and `burst` transmit test data. A term73 monitoring at the other end reports which byte values, or which numbered lines, did not arrive. `/advanced dv rate` paces the writes.
 - Sending needs `/transmit on`. Data with a line that starts with two letters or digits is refused, so nothing sent can be taken as a rig command such as `TX`.
 
-The full test procedure, with the radio settings, is in [docs/dstar-probe-tests.md](docs/dstar-probe-tests.md).
+Both stations of a test can run in one term73: select the second radio with `/b /radio select <n>` and give it commands with `/b` in front. The full test procedure, with the radio settings, is in [docs/dstar-probe-tests.md](docs/dstar-probe-tests.md).
 
 ## Configuration
 
