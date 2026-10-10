@@ -33,6 +33,11 @@ pub struct Radio {
     pub cat_log: Vec<String>,
     pub to_host: Vec<u8>,       // bytes the radio sends to term73
     pub to_air: Vec<Vec<u8>>,   // AX.25 frames the radio transmitted
+    /// In DV Data Mode: every byte written outside KISS, as the radio would transmit it. Rig commands are
+    /// still answered too (how a real radio sorts them is not known yet).
+    pub dv_air: Option<Vec<u8>>,
+    /// Answers no rig commands at all, as the TH-D75 does on its data link in DV Data Mode.
+    pub cat_silent: bool,
     pub decoder: kiss::Decoder,
     pub cat_buf: Vec<u8>,
 }
@@ -128,6 +133,12 @@ impl Link for FakeLink {
                     r.to_air.push(f[1..].to_vec());
                 }
             }
+            return Ok(());
+        }
+        if let Some(air) = r.dv_air.as_mut() {
+            air.extend_from_slice(data);
+        }
+        if r.cat_silent {
             return Ok(());
         }
         r.cat_buf.extend_from_slice(data);

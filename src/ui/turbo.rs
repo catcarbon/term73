@@ -239,7 +239,7 @@ impl App {
             let rig = Rect { x: sx, y: desk.y, width: side_w - 1, height: 8 };
             let lower = Rect { y: rig.bottom() + 1, height: desk.height.saturating_sub(8 + 1 + 1).max(4), ..rig };
             let (title, lines) = self.station_panel(st);
-            for (r, title, lines) in [(rig, " Rig ".to_string(), self.rig_lines(st)), (lower, title, lines)] {
+            for (r, title, lines) in [(rig, self.rig_title().to_string(), self.rig_lines(st)), (lower, title, lines)] {
                 if r.bottom() < desk.bottom() {
                     let inner = window(f, r, &title, tv.side, tv.side_border, desk);
                     f.render_widget(Paragraph::new(lines).style(tv.side), inner);

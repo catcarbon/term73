@@ -19,6 +19,7 @@ use crate::ax25::{self, Config as AxConfig, State, Station};
 use crate::cat;
 use crate::config::{self, AppConfig, RadioProfile};
 use crate::discover::{self, Discovery};
+use crate::dstar;
 use crate::gateways::{self, Candidate};
 use crate::kiss;
 use crate::link::{Link, SerialLink, TcpLink};
@@ -91,6 +92,8 @@ pub struct Snapshot {
     pub winlink_ready: bool,
     pub transmitting: bool,
     pub software_modem: bool,
+    /// The D-STAR data probe's link ("rig-control link" or a port) while it is on.
+    pub dv_probe: Option<String>,
     /// (CTRL band, PTT band) from BC: 0 = A, 1 = B.
     pub bands: Option<(u8, u8)>,
     pub heard: Vec<HeardEntry>,
@@ -157,6 +160,13 @@ pub enum Job {
     /// A Hamlib rigctld request from the rig-control server.
     Rig(rigctld::Req, Sender<Result<rigctld::Resp, i32>>),
     RigCaps(Sender<rigctld::Caps>),
+    /// D-STAR data probe: show what arrives on the rig-control link, or on a separate data port.
+    DvMonitorOn(Option<String>),
+    DvMonitorOff,
+    /// Probe bytes to transmit (radio in DV Data Mode), with a word on what they are.
+    DvSend(Vec<u8>, String),
+    /// Pace probe writes to this many bytes a second; None writes all at once.
+    DvRate(Option<u32>),
     /// Stop: end any session (waiting at most this long for the station), leave packet mode, release the rig.
     Shutdown(Duration),
 }
@@ -243,6 +253,15 @@ struct BridgeSession {
     relaying: bool,
 }
 
+/// The D-STAR data probe (/advanced dv).
+struct DvProbe {
+    /// A separate data port; None when the rig-control link carries the data.
+    link: Option<Box<dyn Link>>,
+    port: Option<String>,
+    monitor: dstar::Monitor,
+    pacer: dstar::Pacer,
+}
+
 struct Engine {
     out: Sender<Out>,
     snap: Arc<Mutex<Snapshot>>,
@@ -290,12 +309,21 @@ struct Engine {
     leave_kiss_pending: bool,
     /// A band a connect took off a memory channel, put back when packet mode ends.
     memory_restore: Option<gateways::MemorySpot>,
+    dv: Option<DvProbe>,
+    dv_rate: Option<u32>,
+    /// The radio did not answer ID when connected: no rig commands are sent until it is selected again.
+    silent: bool,
     running: bool,
 }
 
 /// APRS channels; term73 will not start a connected session on them.
 /// 144.390 North America, 144.800 Europe and Africa, 145.175 Australia, 145.825 the ISS digipeater.
 const APRS_MHZ: &[f64] = &[144.390, 144.800, 145.175, 145.825];
+
+/// Why rig commands are refused for a radio that did not answer when connected.
+const SILENT: &str = "the radio did not answer rig commands when connected. In DV Data Mode the link menu 984 points \
+                      at transmits whatever it gets, rig commands included, so term73 sends none. Turn Data Mode off \
+                      (or point menu 984 at the other interface), then /radio select again";
 
 /// Read BC: the TM-D750 answers "BC ctrl,ptt"; radios with one value use it for both. 0 = A, 1 = B.
 fn read_bands(link: &mut dyn Link) -> Option<(u8, u8)> {
@@ -334,7 +362,8 @@ impl Engine {
             prof: RadioProfile::default(), profile_saved: false, band: 1, freq: None, kiss: false, tx_allowed: false,
             monitor: false, record: None, decoder: kiss::Decoder::new(), station: None, rx_cr: false, bands: None, watch: None, ax25_seen: BTreeMap::new(), ax25_noted: false, session_since: None, session_name: None, closing: false,
             heard: BTreeMap::new(), bridge_listener: None, bridge: None, rigserver: None, keyed_at: None,
-            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, memory_restore: None, running: true,
+            ptt_max: Duration::from_secs(60), close_wait: Duration::from_secs(10), last_tx: None, last_rx: None, leave_kiss_pending: false, memory_restore: None,
+            dv: None, dv_rate: None, silent: false, running: true,
         };
         e.publish();
         e
@@ -364,6 +393,7 @@ impl Engine {
         s.winlink_ready = self.bridge_listener.is_some();
         s.transmitting = self.keyed_at.is_some() || self.last_tx.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
         s.software_modem = self.modem.is_some();
+        s.dv_probe = self.dv.as_ref().map(|p| p.port.clone().unwrap_or_else(|| "rig-control link".into()));
         s.bands = self.bands;
         let mut heard: Vec<HeardEntry> = self.heard.values().cloned().collect();
         heard.sort_by_key(|h| std::cmp::Reverse(h.last_utc_secs));
@@ -493,8 +523,11 @@ impl Engine {
                 if !config::valid_call(&call) {
                     return Err(format!("{call:?} does not look like a callsign"));
                 }
-                self.cfg.callsign = Some(call.to_ascii_uppercase());
-                self.cfg.save().map_err(|e| e.to_string())?;
+                // from the file, not this engine's copy: another engine or a wizard may have saved since
+                let mut cfg = AppConfig::load();
+                cfg.callsign = Some(call.to_ascii_uppercase());
+                cfg.save().map_err(|e| e.to_string())?;
+                self.cfg = cfg;
                 self.say(format!("callsign {} saved", call.to_ascii_uppercase()));
             }
             Job::SetGrid(grid) => {
@@ -502,8 +535,10 @@ impl Engine {
                     return Err(format!("{grid:?} is not a grid locator"));
                 }
                 let g = format!("{}{}", grid[..4].to_ascii_uppercase(), grid[4..].to_ascii_lowercase());
-                self.cfg.grid = Some(g.clone());
-                self.cfg.save().map_err(|e| e.to_string())?;
+                let mut cfg = AppConfig::load();
+                cfg.grid = Some(g.clone());
+                cfg.save().map_err(|e| e.to_string())?;
+                self.cfg = cfg;
                 self.say(format!("grid {g} saved"));
             }
             Job::Connect(call, path) => {
@@ -602,6 +637,28 @@ impl Engine {
             Job::RigCaps(reply) => {
                 let _ = reply.send(self.rig_caps());
             }
+            Job::DvMonitorOn(port) => self.dv_monitor_on(port)?,
+            Job::DvMonitorOff => {
+                let mut p = self.dv.take().ok_or("the D-STAR data monitor is not on")?;
+                for l in p.monitor.flush() {
+                    self.say(format!("dv rx {l}"));
+                }
+                let unsent = p.pacer.pending();
+                self.say(if unsent > 0 { format!("D-STAR data monitor off; {unsent} queued bytes not sent") } else {
+                    "D-STAR data monitor off".into()
+                });
+            }
+            Job::DvSend(data, what) => self.dv_send(data, &what)?,
+            Job::DvRate(rate) => {
+                self.dv_rate = rate;
+                if let Some(p) = self.dv.as_mut() {
+                    p.pacer.set_rate(rate);
+                }
+                self.say(match rate {
+                    Some(r) => format!("D-STAR probe writes paced to {r} bytes/s"),
+                    None => "D-STAR probe writes go out at once".into(),
+                });
+            }
             Job::Shutdown(wait) => {
                 self.close_wait = wait;
                 self.running = false;
@@ -614,6 +671,9 @@ impl Engine {
         if self.radio.is_none() && self.modem.is_none() {
             return Err("no rig: /radio scan, then /radio select <n>".into());
         }
+        if self.silent {
+            return Err(SILENT.into());
+        }
         Ok(())
     }
 
@@ -625,6 +685,9 @@ impl Engine {
         }
         if self.kiss {
             return Err("the radio is busy with packet (connection or listening): end that first".into());
+        }
+        if self.silent {
+            return Err(SILENT.into());
         }
         Ok(())
     }
@@ -670,6 +733,7 @@ impl Engine {
             self.ctl = Some(ctl);
             self.model = Some("MODEM73".into());
             self.target = Some(t.clone());
+            self.publish();
             self.decoder = kiss::Decoder::new();
             self.say(format!("rig: modem73 at {} ({} {}, payload {} B); wire log {}", t.address(),
                              cfgv.get("modulation").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -679,11 +743,23 @@ impl Engine {
         }
         self.radio = Some(link);
         self.target = Some(t.clone());
+        self.publish(); // a second radio must see this device is taken before identification finishes
         self.say(format!("radio connected ({}); wire log {}", t.address(), log_path.display()));
         let r = self.radio.as_deref_mut().unwrap();
         cat::kiss_off(r);
         self.kiss = false;
         self.model = gateways::radio_model(r);
+        if self.model.is_none() {
+            // In DV Data Mode the link menu 984 points at answers no rig commands and transmits what it gets
+            // (seen on a TH-D75), so send nothing more until the radio is selected again.
+            self.band = self.prof.data_band.unwrap_or(1);
+            self.silent = true;
+            self.say("the radio does not answer rig commands (ID). If it is in DV Data Mode with menu 984 on this \
+                      link, it transmits them as data: term73 sends no more rig commands to it. Turn Data Mode off \
+                      (or point menu 984 at the other interface), then /radio select again. /advanced dv monitor on \
+                      watches the data");
+            return Ok(());
+        }
         let tn = cat::cat(r, "TN", Duration::from_secs(2), false).unwrap_or_default();
         self.band = self.prof.data_band.unwrap_or_else(|| tn.split(',').nth(1).and_then(|b| b.parse().ok()).unwrap_or(1));
         self.bands = read_bands(r);
@@ -716,6 +792,8 @@ impl Engine {
         self.leave_kiss();
         self.leave_kiss_pending = false;
         self.put_memory_back();
+        self.dv = None;
+        self.silent = false;
         self.radio = None;
         self.modem = None;
         self.ctl = None;
@@ -791,6 +869,12 @@ impl Engine {
     fn enter_kiss(&mut self) -> Result<(), String> {
         if self.modem.is_some() || self.kiss {
             return Ok(());
+        }
+        if self.dv.is_some() {
+            return Err("the D-STAR data monitor is on: /advanced dv monitor off first".into());
+        }
+        if self.silent {
+            return Err(SILENT.into());
         }
         let band = self.band;
         let r = cat::cat(self.radio.as_deref_mut().ok_or("no radio")?, &format!("TN 2,{band}"), Duration::from_secs(2), false)
@@ -978,6 +1062,7 @@ impl Engine {
     }
 
     fn service(&mut self) -> Result<(), String> {
+        self.service_dv();
         let ready = self.modem.is_some() || (self.radio.is_some() && self.kiss);
         if !ready {
             return Ok(());
@@ -1255,7 +1340,7 @@ impl Engine {
         if self.radio.is_none() && self.modem.is_none() {
             return Err(ENAVAIL);
         }
-        let cat_ok = self.radio.is_some() && !self.kiss;
+        let cat_ok = self.radio.is_some() && !self.kiss && !self.silent;
         match r {
             Req::GetFreq if cat_ok => self.freq_hz().map(Resp::Freq).map_err(|_| ENAVAIL),
             Req::GetFreq => self.freq.map(|f| Resp::Freq((f * 1e6).round() as u64)).ok_or(ENAVAIL),
@@ -1285,6 +1370,9 @@ impl Engine {
                 let code = rigctld::kenwood_mode_code(&name).ok_or(ENAVAIL)?;
                 if self.modem.is_some() || self.radio.is_none() {
                     return Err(ENAVAIL);
+                }
+                if self.silent {
+                    return Err(ERJCTED);
                 }
                 if self.session_active() || self.kiss {
                     return Err(ERJCTED); // packet mode needs FM; do not change it under a session or /listen
@@ -1378,7 +1466,7 @@ impl Engine {
 
     fn ptt(&mut self, on: bool) -> Result<bool, String> {
         if !on {
-            if !self.kiss
+            if !self.kiss && !self.silent
                 && let Some(r) = self.radio.as_deref_mut() {
                     let _ = cat::cat(r, "RX", Duration::from_secs(2), true);
                 }
@@ -1430,6 +1518,108 @@ impl Engine {
         let band = self.band;
         let r = cat::cat(self.radio.as_deref_mut().unwrap(), &format!("FQ {band}"), Duration::from_secs(2), false).unwrap_or_default();
         r.split(',').nth(1).and_then(|v| v.parse().ok()).ok_or(format!("cannot read frequency ({r:?})"))
+    }
+
+    // ------------------------------------------------------------ D-STAR data probe
+
+    fn dv_monitor_on(&mut self, port: Option<String>) -> Result<(), String> {
+        if self.radio.is_none() {
+            return Err(if self.modem.is_some() { "a software modem has no D-STAR data".into() } else {
+                "no radio: /radio scan, then /radio select <n>".into()
+            });
+        }
+        if self.kiss {
+            return Err("the radio is in packet mode: end the session, /listen off or /advanced kiss off first".into());
+        }
+        if self.dv.is_some() {
+            return Err("the D-STAR data monitor is already on (/advanced dv monitor off)".into());
+        }
+        if port.as_deref().is_some_and(|p| self.target.as_ref().is_some_and(|t| t.address().eq_ignore_ascii_case(p))) {
+            return Err("that is the rig-control link: /advanced dv monitor on, without a port, watches it".into());
+        }
+        let link = match &port {
+            None => None,
+            Some(p) => {
+                let t = if crate::bt::is_mac(p) { Target::Bluetooth(p.to_ascii_uppercase()) } else { Target::Serial(p.clone()) };
+                let link = (self.opener)(&t).map_err(|e| format!("could not open {p}: {e}"))?;
+                let logged = crate::link::WireLog::wrap(link, &config::path("logs"), &format!("dv-{p}"));
+                self.say(format!("data port {p} open; wire log {}", logged.path.display()));
+                Some(Box::new(logged) as Box<dyn Link>)
+            }
+        };
+        self.dv = Some(DvProbe { link, port: port.clone(), monitor: dstar::Monitor::default(), pacer: dstar::Pacer::new(self.dv_rate) });
+        self.say(match port {
+            None => "D-STAR data monitor on the rig-control link: what the radio sends unasked is shown in hex. Rig commands \
+                     still work; bytes that arrive during one are only in the wire log".to_string(),
+            Some(p) => format!("D-STAR data monitor on {p}: what arrives there is shown in hex"),
+        });
+        Ok(())
+    }
+
+    fn dv_send(&mut self, data: Vec<u8>, what: &str) -> Result<(), String> {
+        self.need_tx()?;
+        let p = self.dv.as_mut().ok_or("the D-STAR data monitor is off: /advanced dv monitor on [port] first")?;
+        // the radio may still read rig commands on this link, and a line like "TX" or "SR" must never reach it
+        if let Some(line) = dstar::command_like(&data) {
+            return Err(format!("refused: the line {line:?} could be taken as a rig command; start each line with \
+                                another character, such as $ or #"));
+        }
+        let queued = p.pacer.pending() + data.len();
+        if queued > dstar::MAX_SEND {
+            return Err(format!("at most {} bytes can wait to be sent; {} already are", dstar::MAX_SEND, p.pacer.pending()));
+        }
+        if let Some(r) = p.pacer.rate()
+            && Duration::from_secs_f64(queued as f64 / r as f64) > self.ptt_max {
+                return Err(format!("at {r} bytes/s, {queued} bytes would keep the radio keyed over {} s", self.ptt_max.as_secs()));
+            }
+        p.pacer.push(&data);
+        let pace = p.pacer.rate().map(|r| format!(" at {r} bytes/s")).unwrap_or_default();
+        self.say(format!("dv tx: sending {what}, {} bytes{pace}", data.len()));
+        Ok(())
+    }
+
+    /// The D-STAR data probe: write what the pacer allows, show what has arrived.
+    fn service_dv(&mut self) {
+        let Some(p) = self.dv.as_mut() else { return };
+        let now = Instant::now();
+        let shared = p.link.is_none();
+        let link = match p.link.as_deref_mut() {
+            Some(l) => l,
+            None => match self.radio.as_deref_mut() {
+                Some(r) => r,
+                None => return,
+            },
+        };
+        let out = p.pacer.take(now);
+        let mut result = if out.is_empty() { Ok(()) } else { link.write(&out) };
+        let mut lines = Vec::new();
+        if result.is_ok() {
+            match link.read() {
+                Ok(d) => lines = p.monitor.feed(&d, now, &hhmmss(now_utc_secs())),
+                Err(e) => result = Err(e),
+            }
+            lines.extend(p.monitor.poll(now));
+        }
+        let done = p.pacer.finished(now);
+        if !out.is_empty() && result.is_ok() {
+            self.last_tx = Some(now);
+        }
+        for l in lines {
+            self.say(format!("dv rx {l}"));
+        }
+        if let Some((n, took)) = done.filter(|_| result.is_ok()) {
+            let over = if took >= Duration::from_millis(100) { format!(" over {:.1} s", took.as_secs_f64()) } else { String::new() };
+            self.say(format!("dv tx: {n} bytes written to the radio{over}"));
+        }
+        if let Err(e) = result {
+            self.say(format!("error: {e}"));
+            if shared {
+                self.close_rig();
+            } else {
+                self.dv = None;
+                self.say("D-STAR data monitor off: the data port failed");
+            }
+        }
     }
 
     // ------------------------------------------------------------ profiles
@@ -1495,7 +1685,7 @@ impl Engine {
         }
         w.next = Instant::now() + Duration::from_secs(2);
         let cmd = w.cmd.clone();
-        if self.kiss || self.radio.is_none() {
+        if self.kiss || self.radio.is_none() || self.silent {
             self.watch = None;
             self.say("watch stopped: rig control is no longer available");
             return;

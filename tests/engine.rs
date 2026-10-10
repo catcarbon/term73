@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use term73::ax25::{self, State, Station};
 use term73::config::{self, AppConfig, Bbs, RadioProfile};
+use term73::dstar;
 use term73::engine::{self, Handle, Job, Out, Target};
 use term73::kiss;
 use term73::link::Link;
@@ -17,6 +18,8 @@ use common::{air, bbs, tempdir, FakeLink, Radio, ENV};
 
 struct Rig {
     radio: Arc<Mutex<Radio>>,
+    /// What the engine opens as port "DATA" (a separate D-STAR data port).
+    data: Arc<Mutex<Radio>>,
     handle: Option<Handle>,
     out: Receiver<Out>,
     text: String,
@@ -28,10 +31,14 @@ impl Rig {
         let home = tempdir::Dir::new(tag);
         unsafe { std::env::set_var("TERM73_HOME", &home.0) };
         let radio = Arc::new(Mutex::new(Radio { freq: [146_850_000, 145_030_000], power: [1, 2], ..Default::default() }));
-        let r2 = radio.clone();
+        let data = Arc::new(Mutex::new(Radio::default()));
+        let (r2, d2) = (radio.clone(), data.clone());
         let (tx, rx) = mpsc::channel();
-        let handle = engine::spawn(tx, Box::new(move |_t: &Target| Ok(Box::new(FakeLink(r2.clone())) as Box<dyn Link>)));
-        Rig { radio, handle: Some(handle), out: rx, text: String::new(), _home: home }
+        let handle = engine::spawn(tx, Box::new(move |t: &Target| {
+            let r = if t.address() == "DATA" { d2.clone() } else { r2.clone() };
+            Ok(Box::new(FakeLink(r)) as Box<dyn Link>)
+        }));
+        Rig { radio, data, handle: Some(handle), out: rx, text: String::new(), _home: home }
     }
 
     fn h(&self) -> &Handle {
@@ -649,4 +656,141 @@ fn packet_mode_ends_after_the_last_frame_is_sent() {
     rig.wait_for("radio back to normal operation", None);
     assert!(answered.elapsed() >= Duration::from_millis(2500), "left packet mode after {:?}", answered.elapsed());
     assert!(!rig.radio.lock().unwrap().kiss);
+}
+
+/// The D-STAR data probe on the rig-control link: sends only with transmit on and the monitor running,
+/// refuses lines that look like rig commands, shows what arrives, and keeps packet mode out while it runs.
+#[test]
+fn dv_probe_on_the_rig_control_link() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("dvprobe");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    rig.radio.lock().unwrap().dv_air = Some(Vec::new());
+    let send = |rig: &Rig, data: &[u8]| rig.h().send(Job::DvSend(data.to_vec(), "test bytes".into()));
+    send(&rig, b"#hi\r");
+    rig.wait_for("this transmits: /transmit on first", None);
+    rig.h().send(Job::SetCallsign("n0call".into()));
+    rig.h().send(Job::SetTransmit(true));
+    send(&rig, b"#hi\r");
+    rig.wait_for("the D-STAR data monitor is off", None);
+    rig.h().send(Job::DvMonitorOn(None));
+    rig.wait_for("D-STAR data monitor on the rig-control link", None);
+    send(&rig, b"#ok\rTX\r");
+    rig.wait_for("refused: the line \"TX\" could be taken as a rig command", None);
+    send(&rig, &dstar::sweep_payload());
+    rig.wait_for(&format!("dv tx: {} bytes written to the radio", dstar::sweep_payload().len()), None);
+    assert_eq!(rig.radio.lock().unwrap().dv_air.as_deref(), Some(&dstar::sweep_payload()[..]), "nothing else was written");
+
+    // another station's sweep arrives with XON and XOFF lost
+    let lossy: Vec<u8> = dstar::sweep_payload().into_iter().filter(|&b| b != 0x11 && b != 0x13).collect();
+    rig.radio.lock().unwrap().to_host.extend(lossy);
+    rig.wait_for("dv rx sweep: 254 of 256 byte values arrived; missing 11 13", None);
+    // the simulated radio still answers "?" to what it was sent, so those replies lead the dump
+    assert!(rig.text.contains("dv rx 0000  3f 0d 3f 0d 23 54 37 33 53 57 45 45 50 20 00 01  |?.?.#T73SWEEP ..|"),
+            "{}", rig.text);
+
+    rig.h().send(Job::Listen(true, None));
+    rig.wait_for("the D-STAR data monitor is on: /advanced dv monitor off first", None);
+    assert!(!rig.radio.lock().unwrap().kiss);
+
+    // paced writes stay inside the transmit time limit
+    rig.h().send(Job::PttLimit(Duration::from_secs(1)));
+    rig.h().send(Job::DvRate(Some(100)));
+    send(&rig, &dstar::burst_payload(320));
+    rig.wait_for("at 100 bytes/s, 320 bytes would keep the radio keyed over 1 s", None);
+    send(&rig, &dstar::burst_payload(64));
+    rig.wait_for("dv tx: 64 bytes written to the radio over ", None);
+    let took: f64 = rig.text.split("dv tx: 64 bytes written to the radio over ").nth(1).unwrap()
+        .split(' ').next().unwrap().parse().unwrap();
+    assert!(took >= 0.6, "100 bytes/s, took {took} s");
+
+    rig.h().send(Job::DvMonitorOff);
+    rig.wait_for("D-STAR data monitor off", None);
+    rig.h().send(Job::Listen(true, None));
+    rig.wait_for("listening on", None);
+}
+
+/// With a separate data port, probe data goes there and rig control keeps its own link.
+#[test]
+fn dv_probe_on_a_separate_data_port() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("dvport");
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("TM-D750, data band B", None);
+    rig.h().send(Job::DvMonitorOn(Some("com10".into())));
+    rig.wait_for("that is the rig-control link", None);
+    rig.h().send(Job::DvMonitorOn(Some("DATA".into())));
+    rig.wait_for("D-STAR data monitor on DATA", None);
+    let end = Instant::now() + Duration::from_secs(5);
+    while rig.h().snap.lock().unwrap().dv_probe.as_deref() != Some("DATA") {
+        assert!(Instant::now() < end, "the snapshot never showed the probe");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rig.radio.lock().unwrap().dv_air = Some(Vec::new());
+    rig.data.lock().unwrap().dv_air = Some(Vec::new());
+    rig.h().send(Job::SetCallsign("n0call".into()));
+    rig.h().send(Job::SetTransmit(true));
+    rig.h().send(Job::DvSend(dstar::burst_payload(64), "2 numbered lines".into()));
+    rig.wait_for("dv tx: 64 bytes written to the radio", None);
+    assert_eq!(rig.data.lock().unwrap().dv_air.as_deref(), Some(&dstar::burst_payload(64)[..]));
+    assert_eq!(rig.radio.lock().unwrap().dv_air.as_deref(), Some(&[][..]), "nothing on the rig-control link");
+    rig.h().send(Job::Cat("FV".into()));
+    rig.wait_for("FV -> FV 1.02", None);
+
+    let mut lossy = dstar::burst_payload(128);
+    lossy.drain(dstar::BURST_LINE..2 * dstar::BURST_LINE);
+    rig.data.lock().unwrap().to_host.extend(lossy);
+    rig.wait_for("dv rx burst: 3 of 4 lines arrived intact; missing 2", None);
+
+    rig.h().send(Job::Close);
+    rig.wait_for("rig disconnected", None);
+    let end = Instant::now() + Duration::from_secs(5);
+    while rig.h().snap.lock().unwrap().dv_probe.is_some() {
+        assert!(Instant::now() < end, "closing the rig did not end the probe");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A radio in DV Data Mode answers no rig commands on its data link: connecting stops after ID gets no
+/// reply, so nothing more is sent that the radio might transmit, and the data probe can still watch the link.
+#[test]
+fn silent_radio_gets_no_more_rig_commands() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rig = Rig::new("silent");
+    {
+        let mut r = rig.radio.lock().unwrap();
+        r.cat_silent = true;
+        r.dv_air = Some(Vec::new());
+    }
+    rig.h().send(Job::Open(Target::Serial("COM10".into())));
+    rig.wait_for("the radio does not answer rig commands (ID)", None);
+    let sent = String::from_utf8_lossy(rig.radio.lock().unwrap().dv_air.as_deref().unwrap()).into_owned();
+    assert!(sent.ends_with("ID\r"), "ID was the last rig command: {sent:?}");
+    assert!(!sent.contains("TN") && !sent.contains("FQ") && !sent.contains("BC"), "{sent:?}");
+    let (model, _) = rig.h().ask(Job::CurrentProfile, Duration::from_secs(10)).unwrap();
+    assert_eq!(model, None);
+
+    // every path that would send a rig command is refused, and nothing more reaches the radio
+    let before = rig.radio.lock().unwrap().dv_air.clone();
+    rig.h().send(Job::SetTransmit(true));
+    for job in [Job::Cat("ID".into()), Job::Watch(Some("FO 1".into())), Job::Ident, Job::Tune(145.09), Job::Power(2),
+                Job::KissOn, Job::Listen(true, None)] {
+        rig.h().send(job);
+    }
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Ptt(false, tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(true), "unkeying needs no rig command here");
+    let (tx, rx) = mpsc::channel();
+    rig.h().send(Job::Rig(term73::rigctld::Req::SetMode("AM".into()), tx));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Err(term73::rigctld::ERJCTED), "no mode change");
+    rig.h().ask(Job::Discover, Duration::from_secs(10)).expect_err("no capability probing");
+    rig.pump();
+    assert_eq!(rig.text.matches("did not answer rig commands when connected").count(), 7, "{}", rig.text);
+    assert_eq!(rig.radio.lock().unwrap().dv_air, before, "nothing more was sent");
+
+    rig.h().send(Job::DvMonitorOn(None));
+    rig.wait_for("D-STAR data monitor on the rig-control link", None);
+    rig.radio.lock().unwrap().to_host.extend(b"#hello\r");
+    rig.wait_for("dv rx 0000  23 68 65 6c 6c 6f 0d", None);
 }

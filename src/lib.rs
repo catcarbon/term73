@@ -6,6 +6,7 @@ pub mod cat;
 pub mod config;
 pub mod devices;
 pub mod discover;
+pub mod dstar;
 pub mod engine;
 pub mod gateways;
 pub mod kiss;

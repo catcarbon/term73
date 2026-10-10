@@ -264,3 +264,108 @@ fn f8_hides_and_shows_the_side_panels() {
         app.shutdown();
     }
 }
+
+/// Two radios in one window for testing: /b runs commands on radio B, whose lines start with [B];
+/// a sweep sent by radio A and carried "over the air" is checked by radio B's monitor.
+#[test]
+fn two_radios_for_testing() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempdir::Dir::new("ui2");
+    unsafe { std::env::set_var("TERM73_HOME", &home.0) };
+    term73::config::AppConfig { callsign: Some("N0CALL".into()), ..Default::default() }.save().unwrap();
+    for port in ["COM10", "COM11"] {
+        term73::config::save_radio(port, &term73::config::RadioProfile { data_band: Some(1), ..Default::default() }).unwrap();
+    }
+    let a = Arc::new(Mutex::new(Radio { freq: [146_850_000, 145_030_000], ..Default::default() }));
+    let b = Arc::new(Mutex::new(Radio { freq: [146_850_000, 145_030_000], ..Default::default() }));
+    let pick = |a: Arc<Mutex<Radio>>, b: Arc<Mutex<Radio>>| {
+        move |t: &Target| Ok(Box::new(FakeLink(if t.address() == "COM11" { b.clone() } else { a.clone() })) as Box<dyn Link>)
+    };
+    let mut app = App::new(Theme::plain(), Box::new(pick(a.clone(), b.clone())), Arc::new(pick(a.clone(), b.clone())));
+    let radio = |port: &str| Device { target: Target::Serial(port.into()), name: "serial port".into(), serial: true, model: Some("TM-D750".into()) };
+    app.set_scan(vec![radio("COM10"), radio("COM11")]);
+
+    type_line(&mut app, "/radio select 1");
+    wait(&mut app, |a| text(a).contains("radio connected (COM10)"), "radio A");
+    type_line(&mut app, "/b /radio select 1");
+    wait(&mut app, |a| text(a).contains("[B] error: the other radio is using COM10"), "the device guard");
+    type_line(&mut app, "/b /radio select 2");
+    wait(&mut app, |a| text(a).contains("[B] radio connected (COM11)"), "radio B");
+    wait(&mut app, |a| text(a).contains("[B] TM-D750, data band B"), "radio B identified");
+    assert!(b.lock().unwrap().cat_log.contains(&"ID".to_string()), "radio B was asked who it is");
+    type_line(&mut app, "/b /connect N0BBS-3");
+    wait(&mut app, |a| text(a).contains("usage error: radio B is for testing"), "no sessions on radio B");
+    type_line(&mut app, "/b /transmit on");
+    wait(&mut app, |a| text(a).contains("[B] transmit ALLOWED for this session"), "transmit on radio B");
+    assert!(!app.snapshot().transmit_allowed, "radio A keeps transmit off");
+
+    // A sends a sweep; the test carries it over the air to B
+    type_line(&mut app, "/b /advanced dv monitor on");
+    wait(&mut app, |a| text(a).contains("[B] D-STAR data monitor on the rig-control link"), "radio B monitoring");
+    type_line(&mut app, "/advanced dv monitor on");
+    type_line(&mut app, "/transmit on");
+    wait(&mut app, |a| text(a).contains("transmit ALLOWED") && !text(a).ends_with("[B] transmit ALLOWED for this session"), "transmit on radio A");
+    a.lock().unwrap().dv_air = Some(Vec::new());
+    type_line(&mut app, "/advanced dv sweep");
+    let sweep = term73::dstar::sweep_payload();
+    wait(&mut app, |_| a.lock().unwrap().dv_air.as_ref().is_some_and(|v| v.len() >= sweep.len()), "radio A sending");
+    let on_air = a.lock().unwrap().dv_air.take().unwrap();
+    assert_eq!(on_air, sweep);
+    b.lock().unwrap().to_host.extend(on_air);
+    wait(&mut app, |a| text(a).contains("[B] dv rx sweep: all 256 byte values arrived unchanged"), "radio B's sweep check");
+
+    // settings that are not per radio reach both
+    type_line(&mut app, "/config callsign N0CALL-1");
+    wait(&mut app, |a| text(a).contains("[B] callsign N0CALL-1 saved") && text(a).contains("\ncallsign N0CALL-1 saved"), "callsign on both");
+    assert_eq!(term73::config::AppConfig::load().callsign.as_deref(), Some("N0CALL-1"));
+
+    let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    app.tick();
+    term.draw(|f| app.draw(f)).unwrap();
+    let screen: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    let rows: Vec<String> = term.backend().buffer().content().chunks(120).map(|r| r.iter().map(|c| c.symbol()).collect()).collect();
+    for needle in [" RIG A ", "radio B   TM-D750", "COM11", "D-STAR data probe", "transmit ALLOWED"] {
+        assert!(screen.contains(needle), "screen lacks {needle:?}:\n{}", rows.join("\n"));
+    }
+    app.shutdown();
+}
+
+/// A radio whose address changed (another COM number) can take its saved profile instead of a new setup.
+#[test]
+fn saved_profile_at_a_new_address() {
+    let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempdir::Dir::new("ui3");
+    unsafe { std::env::set_var("TERM73_HOME", &home.0) };
+    term73::config::AppConfig { callsign: Some("N0CALL".into()), ..Default::default() }.save().unwrap();
+    let old = term73::config::RadioProfile { model: Some("TM-D750".into()), address: Some("COM10".into()), data_band: Some(0),
+        paclen: Some(200), ..Default::default() };
+    term73::config::save_radio("COM10", &old).unwrap();
+    term73::config::save_radio("COM20", &term73::config::RadioProfile { model: Some("TH-D75".into()), ..Default::default() }).unwrap();
+    let radio = Arc::new(Mutex::new(Radio::default()));
+    let (r1, r2) = (radio.clone(), radio.clone());
+    let mut app = App::new(Theme::plain(), Box::new(move |_t: &Target| Ok(Box::new(FakeLink(r1.clone())) as Box<dyn Link>)),
+                           Arc::new(move |_t: &Target| Ok(Box::new(FakeLink(r2.clone())) as Box<dyn Link>)));
+    let dev = |port: &str| Device { target: Target::Serial(port.into()), name: "serial port".into(), serial: true, model: Some("TM-D750".into()) };
+    app.set_scan(vec![dev("COM12"), dev("COM13")]);
+
+    type_line(&mut app, "/radio select 1");
+    wait(&mut app, |a| a.waiting_for_answer(), "the reuse question");
+    assert!(text(&app).contains("saved profiles for TM-D750:\n  1  TM-D750 COM10, data band A"), "{}", text(&app));
+    assert!(!text(&app).contains("TH-D75"), "only the same model is offered");
+    answer(&mut app, "1");
+    wait(&mut app, |a| text(a).contains("profile saved for TM-D750 COM12"), "the profile copied");
+    let radios = term73::config::load_radios();
+    assert_eq!(radios["COM12"].data_band, Some(0));
+    assert_eq!(radios["COM12"].paclen, Some(200));
+    assert_eq!(radios["COM12"].address.as_deref(), Some("COM12"));
+    assert!(radios.contains_key("COM10"), "the old address keeps its profile");
+
+    // Enter declines and goes on to a new setup
+    type_line(&mut app, "/radio select 2");
+    wait(&mut app, |a| a.waiting_for_answer(), "the reuse question");
+    answer(&mut app, "");
+    wait(&mut app, |a| text(a).contains("no profile for this rig yet; setting one up"), "a new setup");
+    app.ctrl_c();
+    wait(&mut app, |a| !a.busy(), "the setup to be cancelled");
+    app.shutdown();
+}
